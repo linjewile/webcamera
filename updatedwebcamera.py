@@ -28,6 +28,7 @@ def main():
 
         # YOLO can return multiple results, but for webcam it's usually 1 per frame
         annotated_frame = frame.copy()
+        person_count = 0
 
         for r in results:
             boxes = r.boxes
@@ -38,25 +39,39 @@ def main():
                 if cls_id != 0:
                     continue  # skip non-person
 
+                person_count += 1
+
                 # Get bounding box coordinates (x1, y1, x2, y2)
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
 
                 # Draw rectangle and label
-                label = f"person {conf:.2f}"
+                label = f"person {conf*100:.1f}%"
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(
                     annotated_frame,
                     label,
                     (x1, max(y1 - 10, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    0.6,
                     (0, 255, 0),
-                    2
+                    1
                 )
 
+        # Display person count on the frame
+        count_text = f"People Count: {person_count}"
+        cv2.putText(
+            annotated_frame,
+            count_text,
+            (10, 35),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.8,
+            (0, 0, 255),
+            2
+        )
+
         # Show the result
-        cv2.imshow("YOLO People Detection (press 'q' to quit)", annotated_frame)
+        cv2.imshow("c.linjewile face Detection built on YOLO(press 'q' to quit)", annotated_frame)
 
         # Quit with 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
