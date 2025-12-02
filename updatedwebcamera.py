@@ -24,6 +24,11 @@ def process_frame(model, frame):
     results = model(frame, verbose=False)
     annotated_frame = frame.copy()
     person_count = 0
+    
+    # Get frame dimensions for scaling
+    frame_height, frame_width = frame.shape[:2]
+    font_scale = max(0.4, min(0.8, frame_width / 1000))  # Scale font with width
+    thickness = max(1, int(frame_width / 500))  # Scale thickness with width
 
     # YOLO can return multiple results, but for webcam/video it's usually 1 per frame
     for r in results:
@@ -42,29 +47,30 @@ def process_frame(model, frame):
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
 
-            # Draw rectangle and label (keeping your style)
+            # Draw rectangle and label - scaled to frame size
             label = f"person {conf * 100:.1f}%"
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), thickness)
             cv2.putText(
                 annotated_frame,
                 label,
                 (x1, max(y1 - 10, 0)),
                 cv2.FONT_HERSHEY_DUPLEX,
-                0.6,
+                font_scale,
                 (0, 255, 0),
-                1
+                thickness
             )
 
-    # Display person count on the frame (keeping your style)
+    # Display person count on the frame - scaled to frame size
     count_text = f"People Count: {person_count}"
+    count_y_position = int(frame_height * 0.07)  # 7% from top
     cv2.putText(
         annotated_frame,
         count_text,
-        (10, 35),
+        (10, count_y_position),
         cv2.FONT_HERSHEY_DUPLEX,
-        0.8,
+        font_scale * 1.2,
         (0, 0, 255),
-        2
+        thickness
     )
 
     return annotated_frame, person_count
@@ -123,6 +129,19 @@ def run_video_file(model, video_path):
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     duration_sec = total_frames / video_fps if (video_fps and total_frames > 0) else None
 
+    # Ask user if they want to save the output
+    save_choice = input("Do you want to save the processed video? (y/n): ").strip().lower()
+    save_video = save_choice == 'y'
+
+    out = None
+    output_filename = None
+    if save_video:
+        # Setup output video writer
+        output_filename = f"detected_{os.path.basename(video_path)}"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_filename, fourcc, video_fps, (frame_width, frame_height))
+        print(f"[INFO] Output will be saved as: {output_filename}")
+
     print(f"[INFO] Video mode. File: {video_path}")
     if video_fps and total_frames > 0:
         print(f"[INFO] Total frames: {total_frames}, FPS: {video_fps:.2f}, Duration: {format_time(duration_sec)}")
@@ -146,7 +165,7 @@ def run_video_file(model, video_path):
 
         annotated_frame, _ = process_frame(model, frame)
 
-        # Progress info
+        # Progress info - adjust position based on frame height
         if duration_sec and video_fps:
             current_time_in_video = frame_idx / video_fps
             progress_pct = (frame_idx / total_frames) * 100.0
@@ -156,19 +175,26 @@ def run_video_file(model, video_path):
             time_text = "Time: --:-- / --:--"
             progress_text = ""
 
-        # Draw progress info near the bottom
+        # Draw progress info - position scales with frame size
         bottom_text = f"{time_text}   {progress_text}"
+        progress_y_position = int(frame_height * 0.15)  # 15% from top
+        font_scale = max(0.4, min(0.8, frame_width / 1000))  # Scale font with width
+        
         cv2.putText(
             annotated_frame,
             bottom_text,
-            (10, 70),
+            (10, progress_y_position),
             cv2.FONT_HERSHEY_DUPLEX,
-            0.6,
+            font_scale,
             (0, 0, 255),
             1
         )
 
         cv2.imshow(WINDOW_NAME, annotated_frame)
+
+        # Write the annotated frame to output video if saving
+        if save_video and out is not None:
+            out.write(annotated_frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -177,6 +203,11 @@ def run_video_file(model, video_path):
             break
 
     cap.release()
+    if out is not None:
+        out.release()
+
+    if save_video and output_filename:
+        print(f"[INFO] Video saved as: {output_filename}")
 
     # If we hit the natural end of the video, pause on the last frame with a message
     if natural_end and last_frame is not None:
