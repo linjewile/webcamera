@@ -1914,14 +1914,66 @@ def main():
     print("=" * 60)
     print("AI Face Recognition + Expression Detection")
     print("=" * 60)
-    print("\nControls:")
-    print("  'r' - Recognize face (AI local database)")
+    print("\nMode Selection:")
+    print("  1 - Live Webcam")
+    print("  2 - Upload Video File")
+    print("\nSelect mode (1 or 2): ", end='', flush=True)
+    
+    mode_choice = input().strip()
+    video_source = 0  # Default to webcam
+    
+    if mode_choice == '2':
+        print("\nEnter video file path: ", end='', flush=True)
+        video_path = input().strip().strip('"')  # Remove quotes if pasted
+        if os.path.exists(video_path):
+            video_source = video_path
+            print(f"\u2713 Video loaded: {video_path}")
+        else:
+            print(f"\u2717 File not found: {video_path}")
+            print("Falling back to webcam...")
+            video_source = 0
+    
+    # Auto-recognition mode
+    print("\nRecognition Mode:")
+    print("  1 - Manual (use hotkeys 'r' or 'w')")
+    print("  2 - Auto-Recognize (runs automatically)")
+    print("\nSelect recognition mode (1 or 2): ", end='', flush=True)
+    
+    recog_mode = input().strip()
+    auto_recognize = (recog_mode == '2')
+    
+    if auto_recognize:
+        print("\nAuto-Recognition Settings:")
+        print("  1 - Local database only (fast)")
+        print("  2 - Web verification (slower, more accurate)")
+        print("\nSelect method (1 or 2): ", end='', flush=True)
+        auto_method = input().strip()
+        use_web = (auto_method == '2')
+        
+        print("\nCheck faces every N frames (e.g., 30 = once per second): ", end='', flush=True)
+        frame_interval = int(input().strip() or "30")
+        
+        print(f"\n✓ Auto-recognition enabled: {'Web' if use_web else 'Local'} every {frame_interval} frames")
+    else:
+        use_web = False
+        frame_interval = 30
+    
+    print("\n" + "=" * 60)
+    print("Controls (Hotkeys):")
+    print("=" * 60)
+    print("  'r' - Recognize face using AI (local database)")
     print("  'w' - Web verification (LinkedIn→Instagram→Facebook)")
     print("  'a' - Add face to database (learn new person)")
-    print("  'l' - List known faces in database")
-    print("  's' - Save current frame")
-    print("  'q' - Quit")
-    print("\n")
+    print("  'l' - List all known faces in database")
+    print("  's' - Save current frame as image")
+    print("  'q' - Quit program")
+    print("=" * 60)
+    print("\nHotkey Explanation:")
+    print("  - Press a key WHILE video is running")
+    print("  - 'r' = Quick local recognition (fast)")
+    print("  - 'w' = Full web search with verification (slower, more accurate)")
+    print("  - 'a' = Saves current face to learn for future recognition")
+    print("=" * 60 + "\n")
     
     # Check API key
     if SERPAPI_KEY == "YOUR_SERPAPI_KEY_HERE":
@@ -1950,26 +2002,51 @@ def main():
     # Load YOLO model for person detection
     model = YOLO("yolov8n.pt")
     
-    # Open webcam
-    cap = cv2.VideoCapture(0)
+    # Open video source (webcam or file)
+    cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
-        print("Error: Could not open webcam.")
+        print("Error: Could not open video source.")
         return
     
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # Set resolution for webcam (skip for video files)
+    if video_source == 0:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    else:
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"\nVideo Info: {total_frames} frames @ {fps:.2f} FPS")
+        print("Press SPACE to pause/resume video\n")
     
     # Store identified names and recognition results for each face
     face_names = {}  # face_index -> {name, confidence, method}
     search_status = ""
     last_faces = []
     recognition_mode = False  # Toggle between expression and recognition display
+    paused = False  # Video pause state
+    
+    # Auto-recognition tracking
+    frame_count = 0
+    all_matches = []  # Store all recognized faces throughout video
+    match_timestamps = {}  # Track when each person was seen
+    unique_people = set()  # Set of unique names found
     
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Failed to read frame.")
-            break
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                if video_source != 0:  # Video file ended
+                    print("\nVideo ended. Loop? (y/n): ", end='', flush=True)
+                    # For video files, ask to loop
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
+                    continue
+                else:
+                    print("Error: Failed to read frame.")
+                    break
+        else:
+            # Use last frame when paused
+            pass
         
         annotated_frame = frame.copy()
         
@@ -1981,6 +2058,67 @@ def main():
             faces = detect_faces_yolo(frame, model)
         
         last_faces = faces  # Store for identification
+        
+        # AUTO-RECOGNITION MODE
+        if auto_recognize and faces and frame_count % frame_interval == 0:
+            print(f"\n[Frame {frame_count}] Auto-recognizing {len(faces)} face(s)...")
+            
+            for i, (x1, y1, x2, y2) in enumerate(faces):
+                face_crop = frame[y1:y2, x1:x2]
+                if face_crop.size > 0:
+                    if use_web:
+                        # Web verification
+                        result = web_recognizer.recognize_with_verification(face_crop)
+                        if result['status'] in ['verified', 'probable']:
+                            match_info = {
+                                'frame': frame_count,
+                                'name': result['identity'],
+                                'confidence': result['confidence'],
+                                'method': 'web_verified',
+                                'verification_scores': result['verification_scores']
+                            }
+                            all_matches.append(match_info)
+                            unique_people.add(result['identity'])
+                            
+                            # Track timestamp
+                            if result['identity'] not in match_timestamps:
+                                match_timestamps[result['identity']] = []
+                            match_timestamps[result['identity']].append(frame_count)
+                            
+                            face_names[i] = {
+                                'name': result['identity'],
+                                'confidence': result['confidence'],
+                                'method': 'Web (auto)',
+                                'source': 'web_verified'
+                            }
+                            print(f"  ✓ {result['identity']} ({result['confidence']:.1f}%)")
+                    else:
+                        # Local database
+                        result = face_recognizer.recognize_face(face_crop)
+                        if result['status'] == 'match':
+                            match_info = {
+                                'frame': frame_count,
+                                'name': result['name'],
+                                'confidence': result['confidence'],
+                                'method': 'local_db'
+                            }
+                            all_matches.append(match_info)
+                            unique_people.add(result['name'])
+                            
+                            # Track timestamp
+                            if result['name'] not in match_timestamps:
+                                match_timestamps[result['name']] = []
+                            match_timestamps[result['name']].append(frame_count)
+                            
+                            face_names[i] = {
+                                'name': result['name'],
+                                'confidence': result['confidence'],
+                                'method': 'Local (auto)',
+                                'source': 'local_db'
+                            }
+                            print(f"  ✓ {result['name']} ({result['confidence']:.1f}%)")
+        
+        frame_count += 1
         
         # Real-time expression detection for all detected faces
         face_expressions = {}
@@ -2059,6 +2197,13 @@ def main():
         
         # Display status
         status_text = f"Faces: {len(faces)}"
+        if video_source != 0:
+            current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            status_text += f" | Frame: {current_frame}/{total_frames}"
+            if paused:
+                status_text += " [PAUSED]"
+        
         if face_names:
             recognized = [face_names[i]['name'] for i in face_names.keys()]
             status_text += f" | Recognized: {', '.join(recognized[:2])}"
@@ -2377,32 +2522,77 @@ def main():
             print(f"Saved: {filename}")
             search_status = f"Saved: {filename}"
         
-        # elif key == ord('d'):
-        #     # Download profile pictures
-        #     downloaded = 0
-        #     print("\nDownloading profile pictures...")
-        #     for face_id in face_names.keys():
-        #         profiles = identifier.get_profiles(face_id)
-        #         if profiles:
-        #             for p in profiles:
-        #                 if p.get('profile_pic_url'):
-        #                     platform = p['platform'].lower()
-        #                     username = p.get('username', f"face_{face_id}")
-        #                     filename = f"profile_pic_{platform}_{username}_{int(time.time())}.jpg"
-        #                     
-        #                     if identifier.social_scraper.download_profile_picture(p['profile_pic_url'], filename):
-        #                         downloaded += 1
-        #     
-        #     if downloaded > 0:
-        #         print(f"\n✓ Downloaded {downloaded} profile picture(s)")
-        #         search_status = f"Downloaded {downloaded} pics"
-        #     else:
-        #         print("No profile pictures to download. Press 'i' first to identify.")
-        #         search_status = "No pics found"
+        elif key == ord(' '):  # Space bar
+            # Pause/resume video
+            if video_source != 0:
+                paused = not paused
+                search_status = "Paused" if paused else "Playing"
+                print(f"\n{'Paused' if paused else 'Resumed'}")
+        
+        elif key == ord('q'):
+            break
+    
+    # Generate match report before closing
+    if auto_recognize and all_matches:
+        print("\n" + "="*70)
+        print("FACIAL RECOGNITION REPORT")
+        print("="*70)
+        print(f"\nTotal Matches Found: {len(all_matches)}")
+        print(f"Unique People Identified: {len(unique_people)}")
+        print(f"Total Frames Processed: {frame_count}")
+        
+        print("\n" + "-"*70)
+        print("IDENTIFIED PEOPLE:")
+        print("-"*70)
+        
+        for person in sorted(unique_people):
+            appearances = len(match_timestamps[person])
+            frames = match_timestamps[person]
+            avg_confidence = sum(m['confidence'] for m in all_matches if m['name'] == person) / appearances
+            
+            print(f"\n👤 {person}")
+            print(f"   Appearances: {appearances} time(s)")
+            print(f"   Average Confidence: {avg_confidence:.1f}%")
+            print(f"   First seen: Frame {frames[0]}")
+            print(f"   Last seen: Frame {frames[-1]}")
+            
+            # Show frame numbers if not too many
+            if appearances <= 10:
+                print(f"   Frames: {', '.join(map(str, frames))}")
+        
+        print("\n" + "="*70)
+        
+        # Save report to file
+        report_filename = f"recognition_report_{int(time.time())}.txt"
+        with open(report_filename, 'w') as f:
+            f.write("FACIAL RECOGNITION REPORT\n")
+            f.write("="*70 + "\n\n")
+            f.write(f"Total Matches: {len(all_matches)}\n")
+            f.write(f"Unique People: {len(unique_people)}\n")
+            f.write(f"Total Frames: {frame_count}\n\n")
+            f.write("-"*70 + "\n")
+            f.write("IDENTIFIED PEOPLE:\n")
+            f.write("-"*70 + "\n\n")
+            
+            for person in sorted(unique_people):
+                appearances = len(match_timestamps[person])
+                frames = match_timestamps[person]
+                avg_confidence = sum(m['confidence'] for m in all_matches if m['name'] == person) / appearances
+                
+                f.write(f"\n{person}\n")
+                f.write(f"  Appearances: {appearances}\n")
+                f.write(f"  Average Confidence: {avg_confidence:.1f}%\n")
+                f.write(f"  First seen: Frame {frames[0]}\n")
+                f.write(f"  Last seen: Frame {frames[-1]}\n")
+                f.write(f"  All frames: {', '.join(map(str, frames))}\n")
+            
+            f.write("\n" + "="*70 + "\n")
+            f.write("\nDETAILED MATCH LOG:\n")
+            f.write("-"*70 + "\n")
+            for match in all_matches:
+                f.write(f"Frame {match['frame']}: {match['name']} ({match['confidence']:.1f}%) [{match['method']}]\n")
+        
+        print(f"\n💾 Report saved to: {report_filename}")
     
     cap.release()
     cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
