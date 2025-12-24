@@ -1,0 +1,39 @@
+# Face captures and database photos
+*.jpg
+*.jpeg
+*.png
+*.bmp
+face_capture_*
+face_database/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment files
+.env
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+recognition_report_*.txt
+
+# Model files (large)
+*.pt
+*.h5
+*.pb
