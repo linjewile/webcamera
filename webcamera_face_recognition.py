@@ -42,7 +42,7 @@ except ImportError:
 # ============================================
 # CONFIGURATION - SET YOUR API KEY HERE
 # ============================================
-SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "YOUR_SERPAPI_KEY_HERE")
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "38a884c180e17159c5d91242d5f9f6ed827e4d25dcb62a7c1e659a6b26aeed0a")
 
 # Try to import face_recognition (optional - falls back to YOLO face detection)
 try:
@@ -2134,25 +2134,19 @@ def main():
     
     # Auto-recognition mode
     print("\nRecognition Mode:")
-    print("  1 - Manual (use hotkeys 'r' or 'w')")
-    print("  2 - Auto-Recognize (runs automatically)")
+    print("  1 - Manual (use hotkey 'r' to recognize)")
+    print("  2 - Auto-Recognize (runs automatically from local database)")
     print("\nSelect recognition mode (1 or 2): ", end='', flush=True)
     
     recog_mode = input().strip()
     auto_recognize = (recog_mode == '2')
     
     if auto_recognize:
-        print("\nAuto-Recognition Settings:")
-        print("  1 - Local database only (fast)")
-        print("  2 - Web verification (slower, more accurate)")
-        print("\nSelect method (1 or 2): ", end='', flush=True)
-        auto_method = input().strip()
-        use_web = (auto_method == '2')
-        
         print("\nCheck faces every N frames (e.g., 30 = once per second): ", end='', flush=True)
         frame_interval = int(input().strip() or "30")
         
-        print(f"\n✓ Auto-recognition enabled: {'Web' if use_web else 'Local'} every {frame_interval} frames")
+        print(f"\n✓ Auto-recognition enabled: Local database every {frame_interval} frames")
+        use_web = False  # Always use local database only
     else:
         use_web = False
         frame_interval = 30
@@ -2172,35 +2166,38 @@ def main():
     print("Controls (Hotkeys):")
     print("=" * 60)
     print("  'r' - Recognize face using AI (local database)")
-    print("  'w' - Web verification (LinkedIn→Instagram→Facebook)")
+    # print("  'w' - Web verification (DISABLED - LOCAL DATABASE ONLY)")
     print("  'a' - Add face to database (learn new person)")
     print("  'l' - List all known faces in database")
     print("  's' - Save current frame as image")
+    print("  SPACE - Pause/Resume video")
     print("  'q' - Quit program")
     print("=" * 60)
     print("\nHotkey Explanation:")
     print("  - Press a key WHILE video is running")
-    print("  - 'r' = Quick local recognition (fast)")
-    print("  - 'w' = Full web search with verification (slower, more accurate)")
-    print("  - 'a' = Saves current face to learn for future recognition")
+    print("  - 'r' = Recognize face from local database")
+    # print("  - 'w' = Full web search with verification (DISABLED)")
+    print("  - 'a' = Add current face to database")
+    print("  - 'l' = List all people in database")
+    print("=" * 60 + "\n")
     print("=" * 60 + "\n")
     
     # Check API key
-    if SERPAPI_KEY == "YOUR_SERPAPI_KEY_HERE":
-        print("WARNING: SerpAPI key not set!")
-        print("Get a free key at: https://serpapi.com")
-        print("Set it in the script or as environment variable SERPAPI_KEY")
-        print("\n")
+    # if SERPAPI_KEY == "YOUR_SERPAPI_KEY_HERE":
+    #     print("WARNING: SerpAPI key not set!")
+    #     print("Get a free key at: https://serpapi.com")
+    #     print("Set it in the script or as environment variable SERPAPI_KEY")
+    #     print("\n")
     
-    # Initialize face identifier and social scraper
-    identifier = FaceIdentifier(SERPAPI_KEY)
+    # Initialize face identifier and social scraper (DISABLED - LOCAL DATABASE ONLY)
+    # identifier = FaceIdentifier(SERPAPI_KEY)
     
     # Initialize AI face recognizer (local database)
     face_recognizer = DeepFaceRecognizer("face_database")
     known_faces = face_recognizer.list_known_faces()
     
-    # Initialize web verification recognizer (multi-platform)
-    web_recognizer = WebVerificationRecognizer(identifier, identifier.social_scraper)
+    # Initialize web verification recognizer (multi-platform) - DISABLED FOR LOCAL DATABASE FOCUS
+    # web_recognizer = WebVerificationRecognizer(identifier, identifier.social_scraper)
     if known_faces:
         print("Known faces in database:")
         for name, count in known_faces:
@@ -2276,36 +2273,37 @@ def main():
             for i, (x1, y1, x2, y2) in enumerate(faces):
                 face_crop = frame[y1:y2, x1:x2]
                 if face_crop.size > 0:
-                    if use_web:
-                        # Web verification
-                        result = web_recognizer.recognize_with_verification(face_crop)
-                        if result['status'] in ['verified', 'probable']:
-                            match_info = {
-                                'frame': frame_count,
-                                'name': result['identity'],
-                                'confidence': result['confidence'],
-                                'method': 'web_verified',
-                                'verification_scores': result['verification_scores']
-                            }
-                            all_matches.append(match_info)
-                            unique_people.add(result['identity'])
-                            
-                            # Track timestamp
-                            if result['identity'] not in match_timestamps:
-                                match_timestamps[result['identity']] = []
-                            match_timestamps[result['identity']].append(frame_count)
-                            
-                            face_names[i] = {
-                                'name': result['identity'],
-                                'confidence': result['confidence'],
-                                'method': 'Web (auto)',
-                                'source': 'web_verified'
-                            }
-                            print(f"  ✓ {result['identity']} ({result['confidence']:.1f}%)")
-                    else:
-                        # Local database
-                        result = face_recognizer.recognize_face(face_crop)
-                        if result['status'] == 'match':
+                    # WEB VERIFICATION DISABLED - LOCAL DATABASE ONLY
+                    # if use_web:
+                    #     # Web verification
+                    #     result = web_recognizer.recognize_with_verification(face_crop)
+                    #     if result['status'] in ['verified', 'probable']:
+                    #         match_info = {
+                    #             'frame': frame_count,
+                    #             'name': result['identity'],
+                    #             'confidence': result['confidence'],
+                    #             'method': 'web_verified',
+                    #             'verification_scores': result['verification_scores']
+                    #         }
+                    #         all_matches.append(match_info)
+                    #         unique_people.add(result['identity'])
+                    #         
+                    #         # Track timestamp
+                    #         if result['identity'] not in match_timestamps:
+                    #             match_timestamps[result['identity']] = []
+                    #         match_timestamps[result['identity']].append(frame_count)
+                    #         
+                    #         face_names[i] = {
+                    #             'name': result['identity'],
+                    #             'confidence': result['confidence'],
+                    #             'method': 'Web (auto)',
+                    #             'source': 'web_verified'
+                    #         }
+                    #         print(f"  ✓ {result['identity']} ({result['confidence']:.1f}%)")
+                    # else:
+                    # Local database (always use this now)
+                    result = face_recognizer.recognize_face(face_crop)
+                    if result['status'] == 'match':
                             match_info = {
                                 'frame': frame_count,
                                 'name': result['name'],
@@ -2637,50 +2635,51 @@ def main():
                     print("Recognition complete!")
                     print(f"{'='*50}")
         
-        elif key == ord('w'):
-            # Web verification with multi-platform cross-checking
-            if not last_faces:
-                print("No faces detected!")
-                search_status = "No faces detected"
-            else:
-                print(f"\n{'='*60}")
-                print(f"Web Verification for {len(last_faces)} face(s)...")
-                print(f"{'='*60}")
-                
-                face_names.clear()  # Clear previous recognitions
-                
-                for i, (x1, y1, x2, y2) in enumerate(last_faces):
-                    face_crop = frame[y1:y2, x1:x2]
-                    if face_crop.size > 0:
-                        result = web_recognizer.recognize_with_verification(face_crop)
-                        
-                        if result['status'] in ['verified', 'probable']:
-                            face_names[i] = {
-                                'name': result['identity'],
-                                'confidence': result['confidence'],
-                                'method': f"Web ({result['status']})",
-                                'source': 'web_verified',
-                                'verification_scores': result['verification_scores']
-                            }
-                            search_status = f"{result['identity']} ({result['status']})"
-                            
-                            # Show verification breakdown
-                            print("\n📊 Verification Breakdown:")
-                            for platform, score in result['verification_scores'].items():
-                                status = "✓" if score >= 60 else "✗"
-                                print(f"   {status} {platform.capitalize()}: {score:.1f}%")
-                            
-                            # Offer to save to local database
-                            if result['status'] == 'verified':
-                                print("\n💾 Identity verified across multiple platforms!")
-                                print(f"Save {result['identity']} to local database? (y/n): ", end='', flush=True)
-                                save_choice = input().strip().lower()
-                                if save_choice == 'y':
-                                    if face_recognizer.add_face(face_crop, result['identity']):
-                                        print(f"✓ Saved to local database for faster future recognition")
-                        else:
-                            search_status = "No verification match"
-                            print(f"\n❌ Unable to verify identity")
+        # WEB VERIFICATION DISABLED - LOCAL DATABASE ONLY
+        # elif key == ord('w'):
+        #     # Web verification with multi-platform cross-checking
+        #     if not last_faces:
+        #         print("No faces detected!")
+        #         search_status = "No faces detected"
+        #     else:
+        #         print(f"\n{'='*60}")
+        #         print(f"Web Verification for {len(last_faces)} face(s)...")
+        #         print(f"{'='*60}")
+        #         
+        #         face_names.clear()  # Clear previous recognitions
+        #         
+        #         for i, (x1, y1, x2, y2) in enumerate(last_faces):
+        #             face_crop = frame[y1:y2, x1:x2]
+        #             if face_crop.size > 0:
+        #                 result = web_recognizer.recognize_with_verification(face_crop)
+        #                 
+        #                 if result['status'] in ['verified', 'probable']:
+        #                     face_names[i] = {
+        #                         'name': result['identity'],
+        #                         'confidence': result['confidence'],
+        #                         'method': f"Web ({result['status']})",
+        #                         'source': 'web_verified',
+        #                         'verification_scores': result['verification_scores']
+        #                     }
+        #                     search_status = f"{result['identity']} ({result['status']})"
+        #                     
+        #                     # Show verification breakdown
+        #                     print("\n📊 Verification Breakdown:")
+        #                     for platform, score in result['verification_scores'].items():
+        #                         status = "✓" if score >= 60 else "✗"
+        #                         print(f"   {status} {platform.capitalize()}: {score:.1f}%")
+        #                     
+        #                     # Offer to save to local database
+        #                     if result['status'] == 'verified':
+        #                         print("\n💾 Identity verified across multiple platforms!")
+        #                         print(f"Save {result['identity']} to local database? (y/n): ", end='', flush=True)
+        #                         save_choice = input().strip().lower()
+        #                         if save_choice == 'y':
+        #                             if face_recognizer.add_face(face_crop, result['identity']):
+        #                                 print(f"✓ Saved to local database for faster future recognition")
+        #                 else:
+        #                     search_status = "No verification match"
+        #                     print(f"\n❌ Unable to verify identity")
         
         elif key == ord('a'):
             # Add face to database
