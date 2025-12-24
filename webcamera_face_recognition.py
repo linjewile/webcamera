@@ -1794,7 +1794,10 @@ def analyze_facial_landmarks(face_img):
                 quality_score += 25
             
             # Extract unique facial features
-            unique_features = analyze_unique_facial_features(face_img)
+            if not skip_features:
+                unique_features = analyze_unique_facial_features(face_img)
+            else:
+                unique_features = None
             
             return {
                 "landmarks_detected": len(landmarks_list),
@@ -1958,6 +1961,17 @@ def main():
         use_web = False
         frame_interval = 30
     
+    # Performance optimization
+    print("\nPerformance Mode:")
+    print("  1 - Full analysis (all features, slower)")
+    print("  2 - Fast mode (skip unique features, 2-3x faster)")
+    print("\nSelect mode (1 or 2): ", end='', flush=True)
+    perf_mode = input().strip()
+    skip_features = (perf_mode == '2')
+    
+    if skip_features:
+        print("\n⚡ Fast mode enabled: Skipping unique facial features")
+    
     print("\n" + "=" * 60)
     print("Controls (Hotkeys):")
     print("=" * 60)
@@ -2120,10 +2134,11 @@ def main():
         
         frame_count += 1
         
-        # Real-time expression detection for all detected faces
+        # Real-time expression detection (optimized - every 5 frames)
         face_expressions = {}
-        for i, (x1, y1, x2, y2) in enumerate(faces):
-            face_crop = frame[y1:y2, x1:x2]
+        if frame_count % 5 == 0 or not auto_recognize:  # Only analyze every 5th frame in auto mode
+            for i, (x1, y1, x2, y2) in enumerate(faces):
+                face_crop = frame[y1:y2, x1:x2]
             if face_crop.size > 0:
                 landmark_data = analyze_facial_landmarks(face_crop)
                 if landmark_data:
@@ -2133,11 +2148,11 @@ def main():
                         'landmarks': landmark_data['landmarks_detected'],
                         'method': landmark_data.get('detection_method', 'Unknown'),
                         'confidence': landmark_data.get('confidence', landmark_data['quality_score']),
-                        'unique_features': landmark_data.get('unique_features')
+                        'unique_features': landmark_data.get('unique_features') if not skip_features else None
                     }
                     
-                    # Print unique features if detected
-                    if landmark_data.get('unique_features'):
+                    # Print unique features if detected (only in full mode)
+                    if not skip_features and landmark_data.get('unique_features'):
                         uf = landmark_data['unique_features']
                         if uf['dimples']['detected']:
                             print(f"  ✨ Dimples detected: {uf['dimples']['side']} side")
