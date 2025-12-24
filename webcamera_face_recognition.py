@@ -409,6 +409,112 @@ class DeepFaceRecognizer:
         except:
             pass
         return people
+    
+    def add_bulk_faces_from_folder(self, source_folder):
+        """
+        Import multiple faces from an organized folder structure.
+        Expected structure:
+          source_folder/
+            ├── John_Smith/
+            │   ├── photo1.jpg
+            │   ├── photo2.jpg
+            ├── Jane_Doe/
+            │   ├── img1.jpg
+        """
+        if not os.path.exists(source_folder):
+            print(f"✗ Source folder not found: {source_folder}")
+            return 0
+        
+        total_added = 0
+        failed = 0
+        
+        print(f"\n📁 Importing faces from: {source_folder}")
+        print("=" * 60)
+        
+        # Iterate through person folders
+        for person_name in os.listdir(source_folder):
+            person_source = os.path.join(source_folder, person_name)
+            
+            # Skip if not a directory
+            if not os.path.isdir(person_source):
+                continue
+            
+            print(f"\n👤 Processing: {person_name}")
+            
+            # Process all images in person's folder
+            image_files = [f for f in os.listdir(person_source) 
+                          if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
+            
+            if not image_files:
+                print(f"   ⚠️  No images found in {person_name}'s folder")
+                continue
+            
+            person_added = 0
+            for img_file in image_files:
+                img_path = os.path.join(person_source, img_file)
+                
+                try:
+                    # Read image
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        print(f"   ✗ Could not read: {img_file}")
+                        failed += 1
+                        continue
+                    
+                    # Detect face in image
+                    faces = detect_faces_combined(img)
+                    
+                    if len(faces) == 0:
+                        print(f"   ⚠️  No face detected in: {img_file}")
+                        failed += 1
+                        continue
+                    
+                    if len(faces) > 1:
+                        print(f"   ⚠️  Multiple faces in: {img_file} (using largest)")
+                    
+                    # Use the largest face
+                    face = max(faces, key=lambda f: f[2] * f[3])
+                    x, y, w, h = face
+                    face_img = img[y:y+h, x:x+w]
+                    
+                    # Add to database
+                    if self.add_face(face_img, person_name):
+                        person_added += 1
+                        total_added += 1
+                        print(f"   ✓ Imported: {img_file}")
+                    else:
+                        failed += 1
+                        
+                except Exception as e:
+                    print(f"   ✗ Error processing {img_file}: {e}")
+                    failed += 1
+            
+            print(f"   📊 {person_name}: {person_added} photo(s) added")
+        
+        print("\n" + "=" * 60)
+        print(f"✓ Import complete!")
+        print(f"   Total added: {total_added}")
+        print(f"   Failed: {failed}")
+        print(f"   Database location: {self.db_path}")
+        
+        return total_added
+    
+    def remove_person(self, person_name):
+        """Remove a person from the database."""
+        person_dir = os.path.join(self.db_path, person_name)
+        
+        if not os.path.exists(person_dir):
+            print(f"✗ Person not found: {person_name}")
+            return False
+        
+        try:
+            import shutil
+            shutil.rmtree(person_dir)
+            print(f"✓ Removed {person_name} from database")
+            return True
+        except Exception as e:
+            print(f"✗ Error removing {person_name}: {e}")
+            return False
 
 
 class SocialMediaScraper:
@@ -1913,16 +2019,106 @@ def detect_faces_combined(frame):
     return []
 
 
+def database_management():
+    """Database management mode for building and maintaining face database."""
+    recognizer = DeepFaceRecognizer()
+    
+    while True:
+        print("\n" + "=" * 60)
+        print("Face Database Management")
+        print("=" * 60)
+        print("  1 - Import faces from folder (bulk upload)")
+        print("  2 - View database (list all people)")
+        print("  3 - Remove person from database")
+        print("  4 - Back to main menu")
+        print("=" * 60)
+        print("\nSelect option (1-4): ", end='', flush=True)
+        
+        choice = input().strip()
+        
+        if choice == '1':
+            # Bulk import
+            print("\n📁 Bulk Import Instructions:")
+            print("=" * 60)
+            print("Organize photos in folders by person name:")
+            print("  Example:")
+            print("    import_photos/")
+            print("      ├── John_Smith/")
+            print("      │   ├── photo1.jpg")
+            print("      │   ├── photo2.jpg")
+            print("      ├── Jane_Doe/")
+            print("      │   ├── pic1.jpg")
+            print("=" * 60)
+            print("\nEnter folder path containing person folders: ", end='', flush=True)
+            
+            folder_path = input().strip().strip('"')
+            
+            if os.path.exists(folder_path):
+                added = recognizer.add_bulk_faces_from_folder(folder_path)
+                if added > 0:
+                    print(f"\n✓ Successfully imported {added} face(s)!")
+            else:
+                print(f"\n✗ Folder not found: {folder_path}")
+        
+        elif choice == '2':
+            # View database
+            people = recognizer.list_known_faces()
+            
+            if not people:
+                print("\n📊 Database is empty")
+                print("Use option 1 to import faces or use webcam mode with 'a' hotkey")
+            else:
+                print("\n" + "=" * 60)
+                print(f"Face Database ({len(people)} people)")
+                print("=" * 60)
+                for name, count in sorted(people):
+                    print(f"  👤 {name}: {count} photo(s)")
+                print("=" * 60)
+        
+        elif choice == '3':
+            # Remove person
+            people = recognizer.list_known_faces()
+            
+            if not people:
+                print("\n✗ Database is empty")
+                continue
+            
+            print("\n" + "=" * 60)
+            print("People in database:")
+            for i, (name, count) in enumerate(sorted(people), 1):
+                print(f"  {i}. {name} ({count} photo(s))")
+            print("=" * 60)
+            print("\nEnter person name to remove: ", end='', flush=True)
+            
+            name_to_remove = input().strip()
+            recognizer.remove_person(name_to_remove)
+        
+        elif choice == '4':
+            # Back to main menu
+            break
+        
+        else:
+            print("\n✗ Invalid choice. Please enter 1-4.")
+
+
 def main():
     print("=" * 60)
     print("AI Face Recognition + Expression Detection")
     print("=" * 60)
     print("\nMode Selection:")
-    print("  1 - Live Webcam")
+    print("  1 - Live Webcam Recognition")
     print("  2 - Upload Video File")
-    print("\nSelect mode (1 or 2): ", end='', flush=True)
+    print("  3 - Database Management (build/manage face database)")
+    print("\nSelect mode (1, 2, or 3): ", end='', flush=True)
     
     mode_choice = input().strip()
+    
+    # Database management mode
+    if mode_choice == '3':
+        database_management()
+        return
+    
+    # Video source selection
     video_source = 0  # Default to webcam
     
     if mode_choice == '2':
@@ -2611,3 +2807,7 @@ def main():
     
     cap.release()
     cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
