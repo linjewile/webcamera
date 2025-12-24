@@ -42,7 +42,7 @@ except ImportError:
 # ============================================
 # CONFIGURATION - SET YOUR API KEY HERE
 # ============================================
-SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "38a884c180e17159c5d91242d5f9f6ed827e4d25dcb62a7c1e659a6b26aeed0a")
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "YOUR_SERPAPI_KEY_HERE")
 
 # Try to import face_recognition (optional - falls back to YOLO face detection)
 try:
