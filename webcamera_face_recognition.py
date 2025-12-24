@@ -99,6 +99,214 @@ except ImportError:
     print("Install with: pip install google-search-results")
 
 
+class WebVerificationRecognizer:
+    """Multi-platform facial recognition with web scraping and AI verification."""
+    
+    def __init__(self, identifier, social_scraper):
+        self.identifier = identifier
+        self.social_scraper = social_scraper
+        print("🌐 Web Verification Recognizer initialized")
+    
+    def recognize_with_verification(self, face_image):
+        """Recognize face using LinkedIn → Instagram → Facebook verification pipeline."""
+        print("\n" + "="*60)
+        print("MULTI-PLATFORM FACIAL RECOGNITION WITH VERIFICATION")
+        print("="*60)
+        
+        results = {
+            'status': 'unknown',
+            'identity': None,
+            'confidence': 0,
+            'verification_scores': {},
+            'profiles': [],
+            'verification_images': []
+        }
+        
+        # STEP 1: LinkedIn Primary Search (Highest Quality)
+        print("\n📊 STEP 1: LinkedIn Primary Search...")
+        linkedin_result = self._search_linkedin_primary(face_image)
+        
+        if linkedin_result['found']:
+            candidate_name = linkedin_result['name']
+            print(f"   ✓ LinkedIn candidate: {candidate_name}")
+            results['profiles'].append(linkedin_result)
+            
+            # STEP 2: Instagram Verification
+            print("\n📷 STEP 2: Instagram Visual Verification...")
+            instagram_verified = self._verify_instagram(face_image, candidate_name)
+            results['verification_scores']['instagram'] = instagram_verified['score']
+            
+            if instagram_verified['verified']:
+                print(f"   ✓ Instagram verified: {instagram_verified['score']:.1f}% match")
+                results['verification_images'].append(instagram_verified.get('image_path'))
+            else:
+                print(f"   ✗ Instagram verification failed: {instagram_verified['score']:.1f}%")
+            
+            # STEP 3: Facebook Cross-Check
+            print("\n👤 STEP 3: Facebook Cross-Check...")
+            facebook_verified = self._verify_facebook(face_image, candidate_name)
+            results['verification_scores']['facebook'] = facebook_verified['score']
+            
+            if facebook_verified['verified']:
+                print(f"   ✓ Facebook verified: {facebook_verified['score']:.1f}% match")
+                results['verification_images'].append(facebook_verified.get('image_path'))
+            else:
+                print(f"   ✗ Facebook verification failed: {facebook_verified['score']:.1f}%")
+            
+            # STEP 4: Consensus Decision
+            print("\n🎯 STEP 4: Consensus Analysis...")
+            verified_count = sum(1 for score in results['verification_scores'].values() if score >= 60)
+            avg_score = sum(results['verification_scores'].values()) / len(results['verification_scores']) if results['verification_scores'] else 0
+            
+            print(f"   Verified on {verified_count}/2 platforms")
+            print(f"   Average confidence: {avg_score:.1f}%")
+            
+            if verified_count >= 2:
+                results['status'] = 'verified'
+                results['identity'] = candidate_name
+                results['confidence'] = avg_score
+                print(f"\n   ✅ IDENTITY CONFIRMED: {candidate_name}")
+            elif verified_count == 1:
+                results['status'] = 'probable'
+                results['identity'] = candidate_name
+                results['confidence'] = avg_score
+                print(f"\n   ⚠️  PROBABLE MATCH: {candidate_name} (needs more verification)")
+            else:
+                results['status'] = 'uncertain'
+                results['identity'] = candidate_name
+                results['confidence'] = avg_score
+                print(f"\n   ❌ UNCERTAIN: Low verification scores")
+        else:
+            print("   ✗ No LinkedIn matches found")
+            results['status'] = 'unknown'
+        
+        print("="*60 + "\n")
+        return results
+    
+    def _search_linkedin_primary(self, face_image):
+        """Search LinkedIn using reverse image search."""
+        try:
+            # Use existing reverse image search
+            name, image_url = self.identifier._reverse_image_search(face_image)
+            
+            if name and name not in ["Unknown", "API Error", "Search Error", "Upload Failed"]:
+                # Search for LinkedIn profile specifically
+                profiles = self.social_scraper.search_social_by_name(name)
+                linkedin_profiles = [p for p in profiles if 'linkedin' in p.get('platform', '').lower()]
+                
+                if linkedin_profiles:
+                    return {
+                        'found': True,
+                        'name': name,
+                        'url': linkedin_profiles[0]['url'],
+                        'platform': 'LinkedIn',
+                        'image_url': image_url
+                    }
+            
+            return {'found': False}
+        except Exception as e:
+            print(f"   LinkedIn search error: {e}")
+            return {'found': False}
+    
+    def _verify_instagram(self, face_image, person_name):
+        """Verify identity by comparing with Instagram profile picture."""
+        try:
+            # Extract likely username from name
+            username_variations = [
+                person_name.lower().replace(' ', ''),
+                person_name.lower().replace(' ', '_'),
+                person_name.lower().replace(' ', '.'),
+                person_name.split()[0].lower() + person_name.split()[-1].lower()
+            ]
+            
+            for username in username_variations:
+                try:
+                    # Download Instagram profile pic
+                    instagram_pic_path = f"temp_instagram_{username}.jpg"
+                    if self.social_scraper.scrape_instagram_profile_pic(username, instagram_pic_path):
+                        # Use DeepFace to verify faces match
+                        if DEEPFACE_AVAILABLE:
+                            # Save temp face image
+                            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                                cv2.imwrite(tmp.name, face_image)
+                                face_temp_path = tmp.name
+                            
+                            result = DeepFace.verify(
+                                img1_path=face_temp_path,
+                                img2_path=instagram_pic_path,
+                                model_name="VGG-Face",
+                                distance_metric="cosine",
+                                enforce_detection=False
+                            )
+                            
+                            os.unlink(face_temp_path)
+                            
+                            verified = result.get('verified', False)
+                            distance = result.get('distance', 1.0)
+                            confidence = max(0, min(100, (1 - distance) * 100))
+                            
+                            if verified:
+                                return {
+                                    'verified': True,
+                                    'score': confidence,
+                                    'username': username,
+                                    'image_path': instagram_pic_path
+                                }
+                except:
+                    continue
+            
+            return {'verified': False, 'score': 0}
+        except Exception as e:
+            print(f"   Instagram verification error: {e}")
+            return {'verified': False, 'score': 0}
+    
+    def _verify_facebook(self, face_image, person_name):
+        """Verify identity by comparing with Facebook profile picture."""
+        try:
+            # Search Facebook profiles
+            profiles = self.social_scraper.search_social_by_name(person_name)
+            facebook_profiles = [p for p in profiles if 'facebook' in p.get('platform', '').lower()]
+            
+            if facebook_profiles and facebook_profiles[0].get('profile_pic_url'):
+                profile_pic_url = facebook_profiles[0]['profile_pic_url']
+                
+                # Download Facebook profile pic
+                facebook_pic_path = f"temp_facebook_{person_name.replace(' ', '_')}.jpg"
+                if self.social_scraper.download_profile_picture(profile_pic_url, facebook_pic_path):
+                    # Use DeepFace to verify faces match
+                    if DEEPFACE_AVAILABLE:
+                        # Save temp face image
+                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                            cv2.imwrite(tmp.name, face_image)
+                            face_temp_path = tmp.name
+                        
+                        result = DeepFace.verify(
+                            img1_path=face_temp_path,
+                            img2_path=facebook_pic_path,
+                            model_name="VGG-Face",
+                            distance_metric="cosine",
+                            enforce_detection=False
+                        )
+                        
+                        os.unlink(face_temp_path)
+                        
+                        verified = result.get('verified', False)
+                        distance = result.get('distance', 1.0)
+                        confidence = max(0, min(100, (1 - distance) * 100))
+                        
+                        if verified:
+                            return {
+                                'verified': True,
+                                'score': confidence,
+                                'image_path': facebook_pic_path
+                            }
+            
+            return {'verified': False, 'score': 0}
+        except Exception as e:
+            print(f"   Facebook verification error: {e}")
+            return {'verified': False, 'score': 0}
+
+
 class DeepFaceRecognizer:
     """AI-powered face recognition using DeepFace with local database."""
     
@@ -1170,6 +1378,219 @@ def detect_faces_mediapipe(frame):
         print(f"MediaPipe error: {e}")
         return []
 
+def analyze_unique_facial_features(face_img):
+    """Extract unique facial features for identification: dimples, teeth, nose shape, jaw structure."""
+    if not MEDIAPIPE_AVAILABLE:
+        return None
+    
+    try:
+        import mediapipe as mp
+        mp_face_mesh = mp.solutions.face_mesh
+        
+        with mp_face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5) as face_mesh:
+            
+            rgb_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb_img)
+            
+            if not results.multi_face_landmarks:
+                return None
+            
+            face_landmarks = results.multi_face_landmarks[0]
+            landmarks_list = face_landmarks.landmark
+            h, w = face_img.shape[:2]
+            
+            features = {
+                'dimples': {'detected': False, 'side': None, 'depth': 0},
+                'teeth': {'visible': False, 'arrangement': 'unknown', 'gap': False},
+                'nose': {'width': 0, 'bridge_height': 0, 'shape': 'unknown'},
+                'jaw': {'width': 0, 'shape': 'unknown', 'prominence': 0},
+                'smile': {'asymmetry': 0, 'width_ratio': 0, 'gum_visible': False},
+                'face_shape': 'unknown',
+                'signature': None
+            }
+            
+            # === DIMPLE DETECTION ===
+            # Dimples appear as indentations when smiling
+            # Check landmarks near mouth corners (cheek area)
+            left_cheek_upper = landmarks_list[205]  # Left cheek
+            left_cheek_lower = landmarks_list[207]
+            right_cheek_upper = landmarks_list[425]  # Right cheek
+            right_cheek_lower = landmarks_list[427]
+            mouth_left = landmarks_list[61]
+            mouth_right = landmarks_list[291]
+            
+            # Calculate cheek indentation (Z-depth analysis)
+            left_dimple_depth = abs(left_cheek_upper.z - left_cheek_lower.z)
+            right_dimple_depth = abs(right_cheek_upper.z - right_cheek_lower.z)
+            
+            if left_dimple_depth > 0.01 or right_dimple_depth > 0.01:
+                features['dimples']['detected'] = True
+                if left_dimple_depth > right_dimple_depth:
+                    features['dimples']['side'] = 'left' if left_dimple_depth > 0.015 else 'both'
+                    features['dimples']['depth'] = left_dimple_depth
+                else:
+                    features['dimples']['side'] = 'right' if right_dimple_depth > 0.015 else 'both'
+                    features['dimples']['depth'] = right_dimple_depth
+            
+            # === TEETH ARRANGEMENT ===
+            # Check mouth opening and teeth visibility
+            upper_lip = landmarks_list[13]
+            lower_lip = landmarks_list[14]
+            mouth_height = abs(upper_lip.y - lower_lip.y) * h
+            
+            if mouth_height > 8:  # Mouth open enough to see teeth
+                features['teeth']['visible'] = True
+                
+                # Analyze teeth arrangement using upper/lower inner lip landmarks
+                upper_inner_lip = landmarks_list[12]
+                lower_inner_lip = landmarks_list[15]
+                
+                # Check for gap (diastema) - central incisors
+                lip_center_upper = landmarks_list[0]
+                teeth_center_gap = abs(upper_inner_lip.z - lower_inner_lip.z)
+                
+                if teeth_center_gap > 0.02:
+                    features['teeth']['gap'] = True
+                    features['teeth']['arrangement'] = 'gapped'
+                else:
+                    # Analyze alignment
+                    mouth_width = abs(mouth_right.x - mouth_left.x) * w
+                    teeth_width_ratio = mouth_width / w
+                    
+                    if teeth_width_ratio > 0.45:
+                        features['teeth']['arrangement'] = 'wide'
+                    elif teeth_width_ratio < 0.35:
+                        features['teeth']['arrangement'] = 'narrow'
+                    else:
+                        features['teeth']['arrangement'] = 'normal'
+            
+            # === NOSE CHARACTERISTICS ===
+            nose_tip = landmarks_list[1]
+            nose_left = landmarks_list[98]
+            nose_right = landmarks_list[327]
+            nose_bridge_top = landmarks_list[6]
+            nose_bridge_mid = landmarks_list[168]
+            
+            # Nose width
+            nose_width = abs(nose_right.x - nose_left.x) * w
+            features['nose']['width'] = nose_width
+            
+            # Nose bridge height (prominence)
+            bridge_height = abs(nose_bridge_top.z - nose_bridge_mid.z)
+            features['nose']['bridge_height'] = bridge_height
+            
+            # Nose shape classification
+            nose_tip_height = nose_tip.y * h
+            nose_base_height = ((nose_left.y + nose_right.y) / 2) * h
+            nose_projection = abs(nose_tip_height - nose_base_height)
+            
+            if nose_width < 30:
+                features['nose']['shape'] = 'narrow'
+            elif nose_width > 45:
+                features['nose']['shape'] = 'wide'
+            else:
+                if bridge_height > 0.02:
+                    features['nose']['shape'] = 'prominent'
+                elif bridge_height < 0.01:
+                    features['nose']['shape'] = 'flat'
+                else:
+                    features['nose']['shape'] = 'average'
+            
+            # === JAW STRUCTURE ===
+            jaw_left = landmarks_list[172]
+            jaw_right = landmarks_list[397]
+            chin = landmarks_list[152]
+            jaw_left_corner = landmarks_list[234]
+            jaw_right_corner = landmarks_list[454]
+            
+            # Jaw width
+            jaw_width = abs(jaw_right.x - jaw_left.x) * w
+            features['jaw']['width'] = jaw_width
+            
+            # Jaw prominence (Z-depth)
+            jaw_prominence = abs(chin.z)
+            features['jaw']['prominence'] = jaw_prominence
+            
+            # Jaw shape
+            face_width_top = abs(landmarks_list[356].x - landmarks_list[127].x) * w
+            jaw_ratio = jaw_width / face_width_top if face_width_top > 0 else 1
+            
+            if jaw_ratio > 0.95:
+                features['jaw']['shape'] = 'square'
+            elif jaw_ratio < 0.85:
+                features['jaw']['shape'] = 'narrow/oval'
+            else:
+                if jaw_prominence > 0.02:
+                    features['jaw']['shape'] = 'prominent'
+                else:
+                    features['jaw']['shape'] = 'average'
+            
+            # === SMILE CHARACTERISTICS ===
+            # Smile asymmetry
+            left_smile_lift = (mouth_left.y - upper_lip.y) * h
+            right_smile_lift = (mouth_right.y - upper_lip.y) * h
+            smile_asymmetry = abs(left_smile_lift - right_smile_lift)
+            features['smile']['asymmetry'] = smile_asymmetry
+            
+            # Smile width ratio
+            eye_distance = abs(landmarks_list[263].x - landmarks_list[33].x) * w
+            mouth_width = abs(mouth_right.x - mouth_left.x) * w
+            smile_width_ratio = mouth_width / eye_distance if eye_distance > 0 else 0
+            features['smile']['width_ratio'] = smile_width_ratio
+            
+            # Gum visibility (gummy smile)
+            if mouth_height > 12:
+                gum_show = abs(upper_lip.y - upper_inner_lip.y) * h
+                if gum_show > 3:
+                    features['smile']['gum_visible'] = True
+            
+            # === FACE SHAPE ===
+            # Analyze overall proportions
+            forehead_width = abs(landmarks_list[251].x - landmarks_list[21].x) * w
+            cheekbone_width = abs(landmarks_list[454].x - landmarks_list[234].x) * w
+            face_length = abs(landmarks_list[10].y - landmarks_list[152].y) * h
+            
+            face_ratio = face_length / cheekbone_width if cheekbone_width > 0 else 1
+            
+            if face_ratio > 1.5:
+                features['face_shape'] = 'oblong'
+            elif face_ratio < 1.2:
+                if jaw_ratio > 0.95:
+                    features['face_shape'] = 'square'
+                else:
+                    features['face_shape'] = 'round'
+            else:
+                if forehead_width > cheekbone_width:
+                    features['face_shape'] = 'heart'
+                elif cheekbone_width > jaw_width:
+                    features['face_shape'] = 'oval'
+                else:
+                    features['face_shape'] = 'diamond'
+            
+            # === FACIAL SIGNATURE (Unique Identifier) ===
+            # Create a numeric signature from unique features
+            signature = [
+                nose_width,
+                bridge_height * 1000,
+                jaw_width,
+                jaw_prominence * 1000,
+                smile_asymmetry,
+                smile_width_ratio * 100,
+                features['dimples']['depth'] * 1000,
+                mouth_height
+            ]
+            features['signature'] = signature
+            
+            return features
+            
+    except Exception as e:
+        print(f"Facial feature analysis error: {e}")
+        return None
+
 def analyze_facial_landmarks(face_img):
     """Analyze facial landmarks to validate it's a real face and detect expression using AI."""
     # Priority 1: Try DeepFace AI model (most accurate)
@@ -1274,30 +1695,79 @@ def analyze_facial_landmarks(face_img):
             mouth_top_y = mouth_top.y * h
             mouth_curve = mouth_center_y - mouth_top_y
             
-            # Detect expression (6 emotions)
+            # Calculate eye openness for more emotions
+            left_eye_top = landmarks_list[159]
+            left_eye_bottom = landmarks_list[145]
+            right_eye_top = landmarks_list[386]
+            right_eye_bottom = landmarks_list[374]
+            left_eye_openness = abs(left_eye_top.y - left_eye_bottom.y) * h
+            right_eye_openness = abs(right_eye_top.y - right_eye_bottom.y) * h
+            avg_eye_openness = (left_eye_openness + right_eye_openness) / 2
+            
+            # Calculate eyebrow angle (for skeptical/confused)
+            left_eyebrow_angle = left_eyebrow_outer.y - left_eyebrow_inner.y
+            right_eyebrow_angle = right_eyebrow_outer.y - right_eyebrow_inner.y
+            
+            # Detect expression (12 emotions with nuanced detection)
             expression = "neutral"
             
-            # Happy: wide smile, mouth corners raised
-            if mouth_width > eye_distance * 1.15 and mouth_curve < -2:
+            # 1. Joyful/Laughing: very wide smile, open mouth, raised eyebrows
+            if mouth_width > eye_distance * 1.3 and mouth_height > mouth_width * 0.2 and avg_eyebrow_height > 12:
+                expression = "joyful/laughing"
+            
+            # 2. Happy: wide smile, mouth corners raised
+            elif mouth_width > eye_distance * 1.15 and mouth_curve < -2:
                 expression = "happy"
             
-            # Excited/Surprised: wide open mouth, raised eyebrows
-            elif mouth_height > mouth_width * 0.35 and avg_eyebrow_height > 15:
-                expression = "excited/surprised"
+            # 3. Content/Pleased: slight smile, relaxed
+            elif mouth_width > eye_distance * 1.05 and mouth_curve < -1:
+                expression = "content"
             
-            # Shocked: very wide open mouth, very raised eyebrows
+            # 4. Excited: wide open mouth, very raised eyebrows
+            elif mouth_height > mouth_width * 0.4 and avg_eyebrow_height > 18:
+                expression = "excited"
+            
+            # 5. Surprised: open mouth, raised eyebrows, wide eyes
+            elif mouth_height > mouth_width * 0.35 and avg_eyebrow_height > 15 and avg_eye_openness > 8:
+                expression = "surprised"
+            
+            # 6. Shocked/Amazed: very wide open mouth, very raised eyebrows
             elif mouth_height > mouth_width * 0.5 and avg_eyebrow_height > 20:
                 expression = "shocked"
             
-            # Sad: mouth corners down, normal eyebrows
+            # 7. Fearful/Scared: wide eyes, raised eyebrows, small mouth
+            elif avg_eye_openness > 10 and avg_eyebrow_height > 16 and mouth_width < eye_distance * 0.85:
+                expression = "fearful"
+            
+            # 8. Worried/Anxious: raised eyebrows, tight mouth, eyes slightly wide
+            elif avg_eyebrow_height > 12 and mouth_width < eye_distance * 0.9 and avg_eye_openness > 7:
+                expression = "worried"
+            
+            # 9. Sad: mouth corners down, normal eyebrows
             elif mouth_curve > 2 and mouth_width < eye_distance * 0.9:
                 expression = "sad"
             
-            # Angry: eyebrows down/furrowed, tight mouth
+            # 10. Crying/Distressed: mouth corners way down, tight mouth
+            elif mouth_curve > 4 and mouth_width < eye_distance * 0.8:
+                expression = "distressed"
+            
+            # 11. Angry: eyebrows down/furrowed, tight mouth
             elif avg_eyebrow_height < 8 and mouth_width < eye_distance * 0.95:
                 expression = "angry"
             
-            # Neutral: default state
+            # 12. Disgusted: nose wrinkled, mouth corners down, eyebrows lowered
+            elif avg_eyebrow_height < 10 and mouth_curve > 1 and mouth_width < eye_distance * 0.85:
+                expression = "disgusted"
+            
+            # 13. Confused/Skeptical: one eyebrow higher, mouth slightly open
+            elif abs(left_eyebrow_angle - right_eyebrow_angle) > 0.02:
+                expression = "confused"
+            
+            # 14. Bored/Tired: low eyebrows, half-closed eyes
+            elif avg_eye_openness < 5 and avg_eyebrow_height < 10:
+                expression = "bored/tired"
+            
+            # 15. Neutral: default state
             else:
                 expression = "neutral"
             
@@ -1323,6 +1793,9 @@ def analyze_facial_landmarks(face_img):
                    nose_tip.visibility > 0.5]):
                 quality_score += 25
             
+            # Extract unique facial features
+            unique_features = analyze_unique_facial_features(face_img)
+            
             return {
                 "landmarks_detected": len(landmarks_list),
                 "expression": expression,
@@ -1331,7 +1804,8 @@ def analyze_facial_landmarks(face_img):
                 "mouth_width": mouth_width,
                 "face_centered": abs(nose_x - face_center_x) < w * 0.2,
                 "is_valid_face": quality_score >= 75,
-                "detection_method": "MediaPipe Landmarks"
+                "detection_method": "MediaPipe Landmarks",
+                "unique_features": unique_features
             }
             
     except Exception as e:
@@ -1441,7 +1915,8 @@ def main():
     print("AI Face Recognition + Expression Detection")
     print("=" * 60)
     print("\nControls:")
-    print("  'r' - Recognize face (AI face recognition from database)")
+    print("  'r' - Recognize face (AI local database)")
+    print("  'w' - Web verification (LinkedIn→Instagram→Facebook)")
     print("  'a' - Add face to database (learn new person)")
     print("  'l' - List known faces in database")
     print("  's' - Save current frame")
@@ -1455,12 +1930,15 @@ def main():
         print("Set it in the script or as environment variable SERPAPI_KEY")
         print("\n")
     
-    # Initialize face identifier
+    # Initialize face identifier and social scraper
     identifier = FaceIdentifier(SERPAPI_KEY)
     
-    # Initialize AI face recognizer
+    # Initialize AI face recognizer (local database)
     face_recognizer = DeepFaceRecognizer("face_database")
     known_faces = face_recognizer.list_known_faces()
+    
+    # Initialize web verification recognizer (multi-platform)
+    web_recognizer = WebVerificationRecognizer(identifier, identifier.social_scraper)
     if known_faces:
         print("Known faces in database:")
         for name, count in known_faces:
@@ -1516,8 +1994,19 @@ def main():
                         'quality': landmark_data['quality_score'],
                         'landmarks': landmark_data['landmarks_detected'],
                         'method': landmark_data.get('detection_method', 'Unknown'),
-                        'confidence': landmark_data.get('confidence', landmark_data['quality_score'])
+                        'confidence': landmark_data.get('confidence', landmark_data['quality_score']),
+                        'unique_features': landmark_data.get('unique_features')
                     }
+                    
+                    # Print unique features if detected
+                    if landmark_data.get('unique_features'):
+                        uf = landmark_data['unique_features']
+                        if uf['dimples']['detected']:
+                            print(f"  ✨ Dimples detected: {uf['dimples']['side']} side")
+                        if uf['teeth']['visible']:
+                            print(f"  🦷 Teeth: {uf['teeth']['arrangement']}")
+                        print(f"  👃 Nose: {uf['nose']['shape']}")
+                        print(f"  👑 Face shape: {uf['face_shape']}")
         
         # Check for completed searches
         # for face_id, name in identifier.get_results():
@@ -1593,7 +2082,7 @@ def main():
         
         # Draw status
         draw.text((10, 10), status_text, font=font, fill=(0, 0, 0))
-        draw.text((10, 450), "'r'=Recognize 'a'=Add face 'l'=List 's'=Save 'q'=Quit", font=small_font, fill=(100, 100, 100))
+        draw.text((10, 450), "'r'=Local 'w'=Web Verify 'a'=Add 'l'=List 's'=Save 'q'=Quit", font=small_font, fill=(100, 100, 100))
         
         annotated_frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         
@@ -1791,6 +2280,51 @@ def main():
                     print(f"\n{'='*50}")
                     print("Recognition complete!")
                     print(f"{'='*50}")
+        
+        elif key == ord('w'):
+            # Web verification with multi-platform cross-checking
+            if not last_faces:
+                print("No faces detected!")
+                search_status = "No faces detected"
+            else:
+                print(f"\n{'='*60}")
+                print(f"Web Verification for {len(last_faces)} face(s)...")
+                print(f"{'='*60}")
+                
+                face_names.clear()  # Clear previous recognitions
+                
+                for i, (x1, y1, x2, y2) in enumerate(last_faces):
+                    face_crop = frame[y1:y2, x1:x2]
+                    if face_crop.size > 0:
+                        result = web_recognizer.recognize_with_verification(face_crop)
+                        
+                        if result['status'] in ['verified', 'probable']:
+                            face_names[i] = {
+                                'name': result['identity'],
+                                'confidence': result['confidence'],
+                                'method': f"Web ({result['status']})",
+                                'source': 'web_verified',
+                                'verification_scores': result['verification_scores']
+                            }
+                            search_status = f"{result['identity']} ({result['status']})"
+                            
+                            # Show verification breakdown
+                            print("\n📊 Verification Breakdown:")
+                            for platform, score in result['verification_scores'].items():
+                                status = "✓" if score >= 60 else "✗"
+                                print(f"   {status} {platform.capitalize()}: {score:.1f}%")
+                            
+                            # Offer to save to local database
+                            if result['status'] == 'verified':
+                                print("\n💾 Identity verified across multiple platforms!")
+                                print(f"Save {result['identity']} to local database? (y/n): ", end='', flush=True)
+                                save_choice = input().strip().lower()
+                                if save_choice == 'y':
+                                    if face_recognizer.add_face(face_crop, result['identity']):
+                                        print(f"✓ Saved to local database for faster future recognition")
+                        else:
+                            search_status = "No verification match"
+                            print(f"\n❌ Unable to verify identity")
         
         elif key == ord('a'):
             # Add face to database
