@@ -28,6 +28,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Font files (use system default; install locally if needed)
+font familia/
+
 # Temporary files
 *.tmp
 *.log

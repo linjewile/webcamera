@@ -37,11 +37,13 @@ import numpy as np
 import random
 import argparse
 import time
+import threading
+import queue
 from pathlib import Path
 from ultralytics import YOLO
-from PIL import Image, ImageDraw, ImageFont
 import torchvision.ops as _tv_ops
 import torch
+from PIL import Image, ImageDraw, ImageFont
 
 try:
     import supervision as sv
@@ -68,8 +70,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Export
 # ─────────────────────────────────────────────────────────────────────────────
-OUT_WIDTH = 3072
-OUT_FPS   = 24
+OUT_FPS = 24
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Re-ID / ghost buffer
@@ -78,6 +79,11 @@ GHOST_FRAMES    = 72
 REID_APP_W      = 0.65
 REID_IOU_W      = 0.35
 REID_MIN_SCORE  = 0.42
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Frame-skip: run YOLO every N-th frame, reuse detections in between
+# ─────────────────────────────────────────────────────────────────────────────
+DETECT_EVERY    = 3   # run detection/tracking every 3rd frame; render cached boxes otherwise
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Tiled inference  (SAHI-style)
@@ -146,20 +152,20 @@ TAGS = [
     "just got fired",
     "got a promotion today",
     "secretly a millionaire",
-    "owes $47k in student loans",
+    "owes $167k in student loans",
     "just asked for a raise",
     "hasn't filed taxes in 3 years",
     "just quit their job",
     "waiting on a job offer",
-    "starting a startup",
-    "about to be acquired",
+    "is going to be late for work",
+    "just lost their mom",
     "first date tonight",
-    "just got dumped",
+    "just got their first dog",
     "getting married next week",
     "texting their ex",
-    "in love with their best friend",
+    "has a crush on someone in this video",
     "just got cheated on",
-    "hasn't texted back in 3 days",
+    "just farted",
     "about to propose",
     "just had a baby",
     "going through a divorce",
@@ -169,16 +175,16 @@ TAGS = [
     "running late",
     "forgot someone's birthday",
     "just moved to a new city",
-    "going through it",
+    "struggling with their mental health ",
     "best day of their life",
     "worst week of their life",
-    "just got diagnosed",
-    "thinks nobody knows",
-    "main character",
-    "side character",
-    "peak of their life",
-    "already peaked",
-    "definitely not a robot",
+    "just got diagnosed with cancer",
+    "thinking about changing careers",
+    "lost their life savings in crypto",
+    "just graduated",
+    "their parlay just hit",
+    "peaked in highschool",
+    "just had their 4th abortion",
     "just saw something they can't unsee",
     "on their 4th coffee",
     "pretending to be fine",
@@ -186,7 +192,7 @@ TAGS = [
     "mid-life crisis incoming",
     "just manifested something",
     "not who you think they are",
-    "has a secret",
+    "today is their birthday",
     "just changed their mind",
 ]
 
@@ -318,12 +324,15 @@ class PersonHashMap:
         if vec is None:
             return None
 
-        # Search existing entries for a close match
-        best_key, best_sim = None, MATCH_THRESHOLD - 1e-9
-        for stored_key, stored_vec in self._vecs.items():
-            sim = self._cosine(vec, stored_vec)
-            if sim > best_sim:
-                best_sim, best_key = sim, stored_key
+        # Vectorised cosine search (all vecs are L2-normalised)
+        best_key = None
+        if self._vecs:
+            keys = list(self._vecs.keys())
+            mat  = np.stack([self._vecs[k] for k in keys])  # (N, D)
+            sims = mat @ vec                                 # (N,)
+            idx  = int(np.argmax(sims))
+            if sims[idx] >= MATCH_THRESHOLD:
+                best_key = keys[idx]
 
         if best_key is not None:
             # Found — update the running average vector for drift robustness
@@ -333,7 +342,7 @@ class PersonHashMap:
             self._map[best_key]["seen"] = self._map[best_key].get("seen", 1) + 1
             return self._map[best_key]["quote"], self._map[best_key]["palette_idx"]
 
-        # New person — assign quote + palette
+        # New person — assign quote + palette (save deferred to end of video)
         new_key = self._vec_to_key(vec)
         palette_idx = random.randrange(len(PALETTES))
         self._map[new_key]  = {
@@ -342,7 +351,6 @@ class PersonHashMap:
             "seen":        1,
         }
         self._vecs[new_key] = vec
-        self.save()
         return self._map[new_key]["quote"], palette_idx
 
 
@@ -350,7 +358,7 @@ class PersonHashMap:
 #  Track state + ghost buffer  (per-video)
 # ─────────────────────────────────────────────────────────────────────────────
 class TrackState:
-    __slots__ = ("tag", "palette", "last_box", "last_frame", "appearance")
+    __slots__ = ("tag", "palette", "last_box", "last_frame", "appearance", "_app_ctr")
 
     def __init__(self, tag: str, palette_idx: int):
         self.tag        = tag
@@ -358,6 +366,7 @@ class TrackState:
         self.last_box   = None
         self.last_frame = 0
         self.appearance = None
+        self._app_ctr   = 0
 
 
 _registry: dict[int, TrackState] = {}
@@ -428,28 +437,32 @@ def _match_ghost(box, app, current_frame: int) -> int | None:
 def _on_track_seen(track_id: int, box, frame: np.ndarray,
                    frame_idx: int, hashmap: PersonHashMap):
     x1, y1, x2, y2 = box
-    crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
 
     if track_id not in _registry:
-        app   = _appearance_hist(frame, x1, y1, x2, y2)
+        app  = _appearance_hist(frame, x1, y1, x2, y2)
+        crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
         ghost = _match_ghost(box, app, frame_idx)
 
         if ghost is not None:
-            # Resurrect state from ghost buffer
             _registry[track_id] = _ghosts.pop(ghost)
         else:
-            # Ask the hashmap for a persistent quote
             result = hashmap.get_quote(crop) if crop.size > 0 else None
             if result:
                 tag, pal = result
             else:
                 tag, pal = random.choice(TAGS), random.randrange(len(PALETTES))
             _registry[track_id] = TrackState(tag, pal)
+        state = _registry[track_id]
+        state.appearance = app
+    else:
+        state = _registry[track_id]
+        state._app_ctr += 1
+        # Only refresh appearance every 5th frame for established tracks
+        if state._app_ctr % 5 == 0:
+            state.appearance = _appearance_hist(frame, x1, y1, x2, y2)
 
-    state = _registry[track_id]
     state.last_box   = box
     state.last_frame = frame_idx
-    state.appearance = _appearance_hist(frame, x1, y1, x2, y2)
 
 
 def _on_track_lost(track_id: int):
@@ -458,99 +471,82 @@ def _on_track_lost(track_id: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Font
+#  Tag rendering  (Pillow + custom or system font)
 # ─────────────────────────────────────────────────────────────────────────────
-_font_cache: dict = {}
+_LOCAL_FONT = Path(__file__).parent / "font familia" / "Butler FREE" \
+              / "OTF - best in most cases" / "Butler-Free-Bd.otf"
+_FONT_PATH = str(_LOCAL_FONT) if _LOCAL_FONT.exists() else "arial.ttf"
+PAD_X = 8
+PAD_Y = 4
+_MIN_FONT_SIZE = 10
+_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
 
-def _font(size: int):
+
+def _get_font(size: int) -> ImageFont.FreeTypeFont:
     if size not in _font_cache:
-        for path in [
-            "C:/Windows/Fonts/times.ttf",
-            "C:/Windows/Fonts/arial.ttf",
-            "C:/Windows/Fonts/calibri.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]:
-            try:
-                _font_cache[size] = ImageFont.truetype(path, size)
-                break
-            except OSError:
-                pass
-        if size not in _font_cache:
-            _font_cache[size] = ImageFont.load_default()
+        _font_cache[size] = ImageFont.truetype(_FONT_PATH, size)
     return _font_cache[size]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Tag rendering
-# ─────────────────────────────────────────────────────────────────────────────
-PAD_X  = 16
-PAD_Y  = 8
-RADIUS = 12
-LINE_C = (255, 255, 255, 150)
-
-
-def _rounded_rect(draw, x0, y0, x1, y1, r, fill):
-    draw.rectangle([x0+r, y0, x1-r, y1], fill=fill)
-    draw.rectangle([x0, y0+r, x1, y1-r], fill=fill)
-    for cx, cy in [(x0, y0), (x1-2*r, y0), (x0, y1-2*r), (x1-2*r, y1-2*r)]:
-        draw.ellipse([cx, cy, cx+2*r, cy+2*r], fill=fill)
+def _fit_font_size(text: str, max_width: int) -> int:
+    """Find the largest Butler font size that fits `text` within `max_width` pixels."""
+    lo, hi = _MIN_FONT_SIZE, 200
+    best = lo
+    for _ in range(12):  # binary search
+        mid = (lo + hi) // 2
+        font = _get_font(mid)
+        bbox = font.getbbox(text)
+        tw = bbox[2] - bbox[0]
+        if tw + 2 * PAD_X <= max_width:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def render_tags(frame_bgr: np.ndarray, detections: list) -> np.ndarray:
     if not detections:
         return frame_bgr
 
-    h, w  = frame_bgr.shape[:2]
-    fsize = max(20, int(h / 38))
-    font  = _font(fsize)
+    h, w = frame_bgr.shape[:2]
 
-    base    = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    draw    = ImageDraw.Draw(overlay)
+    # Convert to PIL once, draw all tags, convert back
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(frame_rgb)
+    draw = ImageDraw.Draw(pil_img)
 
     for track_id, x1, y1, x2, y2 in detections:
         if track_id not in _registry:
             continue
-        state           = _get_state(track_id)
-        bg_rgba, tx_rgb = state.palette
+        state = _get_state(track_id)
 
-        tb     = font.getbbox(state.tag)
-        tw, th = tb[2]-tb[0], tb[3]-tb[1]
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w < 10 or box_h < 10:
+            continue
 
-        cx      = (x1 + x2) // 2
-        pill_w  = tw + 2 * PAD_X
-        pill_h  = th + 2 * PAD_Y
-        pill_x0 = int(max(4, min(cx - pill_w // 2, w - pill_w - 4)))
-        pill_y0 = int(max(4, y1 - pill_h - 20))
-        pill_x1 = pill_x0 + pill_w
-        pill_y1 = pill_y0 + pill_h
+        font_size = _fit_font_size(state.tag, box_w)
+        font = _get_font(font_size)
+        bbox = font.getbbox(state.tag)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
 
-        draw.line([(cx, y1), (cx, pill_y1)], fill=LINE_C, width=2)
-        r = 5
-        draw.ellipse([cx-r, y1-r, cx+r, y1+r], fill=(*tx_rgb, 230))
-        _rounded_rect(draw, pill_x0, pill_y0, pill_x1, pill_y1, RADIUS, bg_rgba)
-        draw.text((pill_x0 + PAD_X, pill_y0 + PAD_Y), state.tag,
-                  font=font, fill=(*tx_rgb, 255))
-        draw.rectangle([x1, y1, x2, y2], outline=(*tx_rgb, 100), width=2)
+        # Centre text on the person
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        text_x = int(max(0, min(cx - tw // 2, w - tw))) - bbox[0]
+        text_y = int(max(0, min(cy - th // 2, h - th))) - bbox[1]
 
-    return cv2.cvtColor(
-        np.array(Image.alpha_composite(base, overlay).convert("RGB")),
-        cv2.COLOR_RGB2BGR,
-    )
+        draw.text((text_x, text_y), state.tag, fill=(255, 255, 255), font=font)
+
+    frame_bgr[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    return frame_bgr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  3K scaling + writer
 # ─────────────────────────────────────────────────────────────────────────────
-def scale_to_3k(frame: np.ndarray) -> np.ndarray:
-    h, w = frame.shape[:2]
-    if w == OUT_WIDTH:
-        return frame
-    new_h = int(round(h * OUT_WIDTH / w))
-    interp = cv2.INTER_LANCZOS4 if w < OUT_WIDTH else cv2.INTER_AREA
-    return cv2.resize(frame, (OUT_WIDTH, new_h), interpolation=interp)
-
-
 def scale_boxes(dets, sw, sh, dw, dh):
     sx, sy = dw / sw, dh / sh
     return [(t, int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
@@ -558,7 +554,7 @@ def scale_boxes(dets, sw, sh, dw, dh):
 
 
 def make_writer(path: Path, w: int, h: int) -> cv2.VideoWriter:
-    for fc in ("avc1", "H264", "mp4v"):
+    for fc in ("mp4v", "avc1", "H264"):
         wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*fc), OUT_FPS, (w, h))
         if wr.isOpened():
             return wr
@@ -571,8 +567,10 @@ def make_writer(path: Path, w: int, h: int) -> cv2.VideoWriter:
 def process_video(input_path: Path, model: YOLO,
                   conf: float, hashmap: PersonHashMap,
                   tiled: bool = False,
-                  imgsz: int = 1280,
-                  augment: bool = False) -> Path | None:
+                  imgsz: int = 640,
+                  augment: bool = False,
+                  half: bool = False,
+                  detect_every: int = DETECT_EVERY) -> Path | None:
     global _last_frame_count
     _reset_state()
 
@@ -590,9 +588,8 @@ def process_video(input_path: Path, model: YOLO,
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    out_h    = int(round(src_h * OUT_WIDTH / src_w))
     out_path = input_path.parent / f"tagged_{input_path.stem}.mp4"
-    writer   = make_writer(out_path, OUT_WIDTH, out_h)
+    writer   = make_writer(out_path, src_w, src_h)
 
     frame_step  = max(1, round(src_fps / OUT_FPS))
     total_out   = max(1, total // frame_step)
@@ -600,14 +597,49 @@ def process_video(input_path: Path, model: YOLO,
     if _RICH:
         _console.print(f"  [dim]Source :[/dim] {src_w}×{src_h} @ {src_fps:.1f}fps  "
                        f"([dim]{total} frames[/dim])")
-        _console.print(f"  [dim]Output :[/dim] [cyan]{OUT_WIDTH}×{out_h}[/cyan] "
-                       f"@ [cyan]{OUT_FPS}fps[/cyan]")
+        _console.print(f"  [dim]Output :[/dim] [cyan]{src_w}×{src_h}[/cyan] "
+                       f"@ [cyan]{OUT_FPS}fps[/cyan]  [dim](matches source)[/dim]")
     else:
         print(f"  Source : {src_w}x{src_h} @ {src_fps:.1f}fps  ({total} frames)")
-        print(f"  Output : {OUT_WIDTH}x{out_h} @ {OUT_FPS}fps")
+        print(f"  Output : {src_w}x{src_h} @ {OUT_FPS}fps  (matches source)")
 
     prev_ids: set[int] = set()
     frame_idx = write_idx = 0
+    cached_detections: list = []   # reused on skipped frames
+
+    # ── Read-ahead queue ──────────────────────────────────────────────────────
+    # A background thread pre-decodes frames so YOLO never stalls on I/O.
+    # Queue holds (frame_idx, frame_bgr); sentinel None signals end of stream.
+    _Q_SIZE = 8
+    _frame_q: queue.Queue = queue.Queue(maxsize=_Q_SIZE)
+
+    def _reader():
+        idx = 0
+        while True:
+            ret, frm = cap.read()
+            if not ret:
+                _frame_q.put(None)
+                break
+            if idx % frame_step == 0:
+                _frame_q.put((idx, frm))
+            idx += 1
+        # drain any blocking put if consumer already exited
+    _reader_thread = threading.Thread(target=_reader, daemon=True)
+    _reader_thread.start()
+
+    # ── Write-behind queue ────────────────────────────────────────────────────
+    # A background thread encodes/writes frames so the main loop never blocks
+    # on VideoWriter I/O.  Sentinel None signals end of stream.
+    _write_q: queue.Queue = queue.Queue(maxsize=16)
+
+    def _writer_fn():
+        while True:
+            f = _write_q.get()
+            if f is None:
+                break
+            writer.write(f)
+    _writer_thread = threading.Thread(target=_writer_fn, daemon=True)
+    _writer_thread.start()
 
     progress = _make_progress()
     task_id  = None
@@ -617,12 +649,25 @@ def process_video(input_path: Path, model: YOLO,
         nonlocal frame_idx, write_idx, prev_ids
 
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            item = _frame_q.get()
+            if item is None:
                 break
+            frame_idx, frame = item
 
-            if frame_idx % frame_step != 0:
-                frame_idx += 1
+            # ── Frame-skip: reuse cached detections on non-detect frames ──
+            run_detect = (write_idx % detect_every == 0)
+
+            if not run_detect:
+                tagged = render_tags(frame, cached_detections)
+                _write_q.put(tagged)
+                write_idx += 1
+                if _RICH and task_id is not None:
+                    progress.update(task_id, advance=1,
+                                    description=f"[white]{input_path.stem[:30]}[/white]"
+                                                f"  [dim yellow]{len(cached_detections)} people[/dim yellow]")
+                elif write_idx % 24 == 0:
+                    pct = frame_idx / total * 100 if total else 0
+                    print(f"    {write_idx} frames written  ({pct:.0f}%)", end="\r")
                 continue
 
             if tiled and _SV:
@@ -658,7 +703,7 @@ def process_video(input_path: Path, model: YOLO,
                     frame, persist=True, classes=[0],
                     conf=conf, iou=0.4, imgsz=imgsz,
                     verbose=False, tracker="botsort.yaml",
-                    augment=augment,
+                    augment=augment, half=half,
                 )
 
                 detections = []
@@ -680,14 +725,11 @@ def process_video(input_path: Path, model: YOLO,
                 _on_track_lost(lost)
             prev_ids = curr_ids
 
-            frame_3k   = scale_to_3k(frame)
-            oh, ow     = frame_3k.shape[:2]
-            dets_sc    = scale_boxes(detections, src_w, src_h, ow, oh)
-            tagged     = render_tags(frame_3k, dets_sc)
-            writer.write(tagged)
+            cached_detections = detections   # cache for skipped frames
+            tagged = render_tags(frame, detections)
+            _write_q.put(tagged)
 
             write_idx += 1
-            frame_idx += 1
 
             if _RICH and task_id is not None:
                 n_people = len(curr_ids)
@@ -708,6 +750,9 @@ def process_video(input_path: Path, model: YOLO,
     else:
         _run()
 
+    _write_q.put(None)
+    _writer_thread.join()
+    _reader_thread.join()
     cap.release()
     writer.release()
     hashmap.save()
@@ -780,23 +825,57 @@ def _make_progress():
     return None
 
 
+def _prompt_for_videos() -> list[Path]:
+    """
+    Prompt the user to paste/drag-drop a single video file path.
+    """
+    exts = {".mp4", ".mov", ".avi", ".mkv"}
+
+    if _RICH:
+        _console.print("[dim]Paste or drag a video file path below.[/dim]\n")
+    else:
+        print("Paste or drag a video file path below.\n")
+
+    while True:
+        try:
+            line = input("  Video path: ").strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return []
+        if not line:
+            return []
+        p = Path(line)
+        if not p.exists():
+            print(f"    [!] File not found: {p}")
+            continue
+        if p.suffix.lower() not in exts:
+            print(f"    [!] Unsupported format: {p.suffix}  (use mp4/mov/avi/mkv)")
+            continue
+        print(f"    ✓ Loaded: {p.name}")
+        return [p]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Overlay persistent life-status tags on crowd footage."
     )
     parser.add_argument("videos", nargs="*",
                         help="Video files (default: all in ./webcamera/)")
-    parser.add_argument("--conf",   type=float, default=0.25,
-                        help="Detection confidence threshold (default 0.25)")
+    parser.add_argument("--conf",   type=float, default=0.18,
+                        help="Detection confidence threshold (default 0.18)")
     parser.add_argument("--model",  default="yolov8m.pt",
-                        help="YOLO model weights (default yolov8m — better for crowds)")
+                        help="YOLO model weights (default yolov8m — best for crowds)")
     parser.add_argument("--imgsz",  type=int, default=1280,
-                        help="Input resolution for YOLO (default 1280 — catches small people)")
+                        help="Input resolution for YOLO (default 1280 — catches small/distant people)")
     parser.add_argument("--tile",   action="store_true",
                         help="Tiled inference: slice frame into overlapping patches "
                              "(best for very dense crowds; requires `pip install supervision`)")
     parser.add_argument("--augment", action="store_true",
                         help="Test-time augmentation — slower but higher recall")
+    parser.add_argument("--half", action="store_true",
+                        help="fp16 inference — ~2x faster on NVIDIA GPU (CUDA only)")
+    parser.add_argument("--skip", type=int, default=DETECT_EVERY,
+                        help=f"Run detection every N-th frame, reuse boxes in between (default {DETECT_EVERY})")
     parser.add_argument("--print-map", action="store_true",
                         help="Print the full person→quote hashmap and exit")
     args = parser.parse_args()
@@ -804,6 +883,10 @@ def main():
     if args.tile and not _SV:
         print("WARNING: --tile requires `pip install supervision`. Falling back to standard mode.")
         args.tile = False
+
+    # Auto-enable fp16 on CUDA for a ~2x speedup
+    if not args.half and torch.cuda.is_available():
+        args.half = True
 
     _print_banner()
 
@@ -813,13 +896,11 @@ def main():
         hashmap.print_map()
         return
 
+    # ── Collect video file ────────────────────────────────────────────────
     if args.videos:
-        input_files = [Path(v) for v in args.videos]
+        input_files = [Path(args.videos[0])]
     else:
-        vdir        = Path(__file__).parent / "webcamera"
-        exts        = {".mp4", ".mov", ".avi", ".mkv", ".MP4", ".MOV", ".AVI"}
-        input_files = sorted(f for f in vdir.iterdir()
-                             if f.suffix in exts and not f.stem.startswith("tagged_"))
+        input_files = _prompt_for_videos()
 
     if not input_files:
         (_console.print("[yellow]No videos found.[/yellow]") if _RICH
@@ -831,21 +912,26 @@ def main():
         with _console.status(f"[bright_yellow]Loading {args.model}…[/bright_yellow]",
                              spinner="dots"):
             model = YOLO(args.model)
-        _console.print(f"[green]✓[/green] Model loaded: [bold]{args.model}[/bold]")
+        if args.half:
+            model.half()
+        _console.print(f"[green]✓[/green] Model loaded: [bold]{args.model}[/bold]"
+                       + (" [dim](fp16)[/dim]" if args.half else ""))
     else:
         print(f"Loading {args.model}…")
         model = YOLO(args.model)
+        if args.half:
+            model.half()
 
     mode_str = ("tiled" if args.tile else f"imgsz={args.imgsz}") + \
                (" +augment" if args.augment else "")
     if _RICH:
-        _console.print(f"  Output  : [cyan]{OUT_WIDTH}px[/cyan] wide · "
+        _console.print(f"  Output  : [cyan]source resolution[/cyan] · "
                        f"[cyan]{OUT_FPS}fps[/cyan]")
         _console.print(f"  Mode    : [cyan]{mode_str}[/cyan]  "
                        f"conf=[cyan]{args.conf}[/cyan]")
         _console.print(f"  Videos  : [cyan]{len(input_files)}[/cyan]\n")
     else:
-        print(f"Output : {OUT_WIDTH}px wide · {OUT_FPS}fps")
+        print(f"Output : source resolution · {OUT_FPS}fps")
         print(f"Mode   : {mode_str}  conf={args.conf}")
         print(f"Videos : {len(input_files)}\n")
 
@@ -856,7 +942,9 @@ def main():
             _console.rule(f"[bold white]{i}/{len(input_files)}  {video.name}[/bold white]")
         t0 = time.time()
         out = process_video(video, model, conf=args.conf, hashmap=hashmap,
-                            tiled=args.tile, imgsz=args.imgsz, augment=args.augment)
+                            tiled=args.tile, imgsz=args.imgsz,
+                            augment=args.augment, half=args.half,
+                            detect_every=args.skip)
         elapsed = time.time() - t0
         # process_video returns frame count via its own print; we track externally
         # Collect frame count from out metadata isn't available, use a sentinel
