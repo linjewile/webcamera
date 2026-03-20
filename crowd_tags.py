@@ -36,9 +36,34 @@ import json
 import numpy as np
 import random
 import argparse
+import time
 from pathlib import Path
 from ultralytics import YOLO
 from PIL import Image, ImageDraw, ImageFont
+import torchvision.ops as _tv_ops
+import torch
+
+try:
+    import supervision as sv
+    _SV = True
+except ImportError:
+    _SV = False
+
+try:
+    from rich.console import Console
+    from rich.progress import (
+        Progress, SpinnerColumn, BarColumn,
+        TextColumn, TimeElapsedColumn, TimeRemainingColumn, TaskProgressColumn,
+    )
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich import box as rbox
+    _RICH = True
+    _console = Console()
+except ImportError:
+    _RICH = False
+    _console = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Export
@@ -53,6 +78,66 @@ GHOST_FRAMES    = 72
 REID_APP_W      = 0.65
 REID_IOU_W      = 0.35
 REID_MIN_SCORE  = 0.42
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Tiled inference  (SAHI-style)
+#  Slices the frame into overlapping tiles so small/distant people are caught.
+#  Each tile is run through YOLO independently, boxes are mapped back to the
+#  full-frame coordinate space, then merged with NMS.
+# ─────────────────────────────────────────────────────────────────────────────
+TILE_SIZE    = 640   # each tile fed to YOLO (px)
+TILE_OVERLAP = 0.25  # 25 % overlap between adjacent tiles
+TILE_NMS_IOU = 0.45  # IoU threshold for merging duplicate boxes across tiles
+
+
+def _tile_detect(model: YOLO, frame: np.ndarray,
+                 conf: float, imgsz: int = TILE_SIZE) -> list[tuple]:
+    """
+    Slice `frame` into overlapping tiles, run YOLO on each, map boxes back
+    to full-frame coordinates, then merge duplicates with NMS.
+
+    Returns list of (x1, y1, x2, y2, score) in full-frame pixel space.
+    """
+    H, W = frame.shape[:2]
+    stride = int(imgsz * (1 - TILE_OVERLAP))
+    all_boxes:  list[list[float]] = []
+    all_scores: list[float]       = []
+
+    # Generate tile origins
+    xs = list(range(0, max(1, W - imgsz), stride)) + [max(0, W - imgsz)]
+    ys = list(range(0, max(1, H - imgsz), stride)) + [max(0, H - imgsz)]
+    xs = sorted(set(xs))
+    ys = sorted(set(ys))
+
+    for y0 in ys:
+        for x0 in xs:
+            x1c = min(x0 + imgsz, W)
+            y1c = min(y0 + imgsz, H)
+            tile = frame[y0:y1c, x0:x1c]
+
+            results = model.predict(tile, classes=[0], conf=conf,
+                                    verbose=False, imgsz=imgsz)
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                    score = float(box.conf[0])
+                    # Map back to full-frame coords
+                    all_boxes.append([bx1 + x0, by1 + y0,
+                                      bx2 + x0, by2 + y0])
+                    all_scores.append(score)
+
+    if not all_boxes:
+        return []
+
+    boxes_t  = torch.tensor(all_boxes,  dtype=torch.float32)
+    scores_t = torch.tensor(all_scores, dtype=torch.float32)
+    keep     = _tv_ops.nms(boxes_t, scores_t, TILE_NMS_IOU)
+
+    return [(int(boxes_t[i][0]), int(boxes_t[i][1]),
+             int(boxes_t[i][2]), int(boxes_t[i][3]),
+             float(scores_t[i])) for i in keep.tolist()]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Life-status tags
@@ -277,6 +362,7 @@ class TrackState:
 
 _registry: dict[int, TrackState] = {}
 _ghosts:   dict[int, TrackState] = {}
+_last_frame_count: int = 0
 
 
 def _reset_state():
@@ -483,12 +569,20 @@ def make_writer(path: Path, w: int, h: int) -> cv2.VideoWriter:
 #  Process one video
 # ─────────────────────────────────────────────────────────────────────────────
 def process_video(input_path: Path, model: YOLO,
-                  conf: float, hashmap: PersonHashMap) -> Path | None:
+                  conf: float, hashmap: PersonHashMap,
+                  tiled: bool = False,
+                  imgsz: int = 1280,
+                  augment: bool = False) -> Path | None:
+    global _last_frame_count
     _reset_state()
+
+    # Per-video tracker for tiled mode
+    sv_tracker = sv.ByteTrack() if (tiled and _SV) else None
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
-        print(f"  [!] Cannot open {input_path.name}")
+        (_console.print(f"[red]  [!] Cannot open {input_path.name}[/red]") if _RICH
+         else print(f"  [!] Cannot open {input_path.name}"))
         return None
 
     src_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -500,81 +594,218 @@ def process_video(input_path: Path, model: YOLO,
     out_path = input_path.parent / f"tagged_{input_path.stem}.mp4"
     writer   = make_writer(out_path, OUT_WIDTH, out_h)
 
-    frame_step = max(1, round(src_fps / OUT_FPS))
+    frame_step  = max(1, round(src_fps / OUT_FPS))
+    total_out   = max(1, total // frame_step)
 
-    print(f"  {input_path.name}")
-    print(f"    Source : {src_w}x{src_h} @ {src_fps:.1f}fps  ({total} frames)")
-    print(f"    Output : {OUT_WIDTH}x{out_h} @ {OUT_FPS}fps")
+    if _RICH:
+        _console.print(f"  [dim]Source :[/dim] {src_w}×{src_h} @ {src_fps:.1f}fps  "
+                       f"([dim]{total} frames[/dim])")
+        _console.print(f"  [dim]Output :[/dim] [cyan]{OUT_WIDTH}×{out_h}[/cyan] "
+                       f"@ [cyan]{OUT_FPS}fps[/cyan]")
+    else:
+        print(f"  Source : {src_w}x{src_h} @ {src_fps:.1f}fps  ({total} frames)")
+        print(f"  Output : {OUT_WIDTH}x{out_h} @ {OUT_FPS}fps")
 
     prev_ids: set[int] = set()
     frame_idx = write_idx = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    progress = _make_progress()
+    task_id  = None
+    ctx      = progress if _RICH else None
 
-        if frame_idx % frame_step != 0:
-            frame_idx += 1
-            continue
+    def _run():
+        nonlocal frame_idx, write_idx, prev_ids
 
-        results = model.track(
-            frame, persist=True, classes=[0],
-            conf=conf, verbose=False, tracker="botsort.yaml",
-        )
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        detections = []
-        curr_ids   = set()
-
-        for r in results:
-            if r.boxes is None:
+            if frame_idx % frame_step != 0:
+                frame_idx += 1
                 continue
-            for box in r.boxes:
-                if box.id is None:
-                    continue
-                tid          = int(box.id[0])
-                x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
-                detections.append((tid, x1, y1, x2, y2))
-                curr_ids.add(tid)
-                _on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx, hashmap)
 
-        for lost in prev_ids - curr_ids:
-            _on_track_lost(lost)
-        prev_ids = curr_ids
+            if tiled and _SV:
+                # ── Tiled inference + supervision ByteTrack ──────────────────
+                # Tile detect gives us far more boxes for small/distant people.
+                # supervision.ByteTrack accepts pre-computed boxes directly,
+                # so track state is correctly maintained across frames.
+                raw_boxes = _tile_detect(model, frame, conf)
+                if raw_boxes:
+                    xyxy   = np.array([[x1,y1,x2,y2] for x1,y1,x2,y2,_ in raw_boxes])
+                    confs  = np.array([s for _,_,_,_,s in raw_boxes])
+                    clsids = np.zeros(len(raw_boxes), dtype=int)
+                    sv_det = sv.Detections(xyxy=xyxy, confidence=confs, class_id=clsids)
+                else:
+                    sv_det = sv.Detections.empty()
 
-        frame_3k   = scale_to_3k(frame)
-        oh, ow     = frame_3k.shape[:2]
-        dets_sc    = scale_boxes(detections, src_w, src_h, ow, oh)
-        tagged     = render_tags(frame_3k, dets_sc)
-        writer.write(tagged)
+                sv_tracks = sv_tracker.update_with_detections(sv_det)
 
-        write_idx += 1
-        frame_idx += 1
-        if write_idx % 24 == 0:
-            pct = frame_idx / total * 100 if total else 0
-            print(f"    {write_idx} frames written  ({pct:.0f}%)", end="\r")
+                detections = []
+                curr_ids   = set()
+                for i in range(len(sv_tracks)):
+                    tid          = int(sv_tracks.tracker_id[i])
+                    x1,y1,x2,y2 = map(int, sv_tracks.xyxy[i])
+                    detections.append((tid, x1, y1, x2, y2))
+                    curr_ids.add(tid)
+                    _on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx, hashmap)
+
+            else:
+                # ── Standard model.track at high resolution ──────────────────
+                # imgsz=1280 catches small/distant people that 640 misses.
+                # iou=0.4 separates closely-packed people better than default 0.7.
+                results = model.track(
+                    frame, persist=True, classes=[0],
+                    conf=conf, iou=0.4, imgsz=imgsz,
+                    verbose=False, tracker="botsort.yaml",
+                    augment=augment,
+                )
+
+                detections = []
+                curr_ids   = set()
+
+                for r in results:
+                    if r.boxes is None:
+                        continue
+                    for box in r.boxes:
+                        if box.id is None:
+                            continue
+                        tid          = int(box.id[0])
+                        x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
+                        detections.append((tid, x1, y1, x2, y2))
+                        curr_ids.add(tid)
+                        _on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx, hashmap)
+
+            for lost in prev_ids - curr_ids:
+                _on_track_lost(lost)
+            prev_ids = curr_ids
+
+            frame_3k   = scale_to_3k(frame)
+            oh, ow     = frame_3k.shape[:2]
+            dets_sc    = scale_boxes(detections, src_w, src_h, ow, oh)
+            tagged     = render_tags(frame_3k, dets_sc)
+            writer.write(tagged)
+
+            write_idx += 1
+            frame_idx += 1
+
+            if _RICH and task_id is not None:
+                n_people = len(curr_ids)
+                progress.update(task_id, advance=1,
+                                description=f"[white]{input_path.stem[:30]}[/white]"
+                                            f"  [dim yellow]{n_people} people[/dim yellow]")
+            elif write_idx % 24 == 0:
+                pct = frame_idx / total * 100 if total else 0
+                print(f"    {write_idx} frames written  ({pct:.0f}%)", end="\r")
+
+    if _RICH:
+        with progress:
+            task_id = progress.add_task(
+                f"[white]{input_path.stem[:30]}[/white]",
+                total=total_out,
+            )
+            _run()
+    else:
+        _run()
 
     cap.release()
     writer.release()
     hashmap.save()
-    print(f"\n  Saved → {out_path.name}  ({write_idx} frames)")
+    _last_frame_count = write_idx
+
+    if _RICH:
+        _console.print(f"  [green]✓[/green] Saved → [bold]{out_path.name}[/bold]  "
+                       f"([cyan]{write_idx}[/cyan] frames)\n")
+    else:
+        print(f"\n  Saved → {out_path.name}  ({write_idx} frames)")
     return out_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Entry point
 # ─────────────────────────────────────────────────────────────────────────────
+def _print_banner():
+    if _RICH:
+        title = Text("CROWD TAGS", style="bold white")
+        sub   = Text("life-status overlay engine", style="dim white")
+        panel = Panel.fit(
+            f"[bold white]CROWD TAGS[/bold white]\n[dim]life-status overlay engine[/dim]",
+            border_style="bright_yellow",
+            padding=(1, 4),
+        )
+        _console.print()
+        _console.print(panel, justify="center")
+        _console.print()
+    else:
+        print("\n" + "═"*50)
+        print("   CROWD TAGS  —  life-status overlay engine")
+        print("═"*50 + "\n")
+
+
+def _print_summary(results: list[tuple[str, int, float]]):
+    """results: list of (filename, frame_count, elapsed_secs)"""
+    if _RICH:
+        table = Table(title="[bold]Processing Summary[/bold]",
+                      box=rbox.SIMPLE_HEAVY, border_style="bright_yellow",
+                      show_lines=False)
+        table.add_column("File",    style="white")
+        table.add_column("Frames",  style="cyan",  justify="right")
+        table.add_column("Time",    style="yellow", justify="right")
+        for name, frames, elapsed in results:
+            mins, secs = divmod(int(elapsed), 60)
+            table.add_row(name, str(frames), f"{mins}m {secs:02d}s")
+        _console.print()
+        _console.print(table)
+        _console.print("[bold bright_yellow]All done.[/bold bright_yellow]\n")
+    else:
+        print("\nSummary:")
+        for name, frames, elapsed in results:
+            mins, secs = divmod(int(elapsed), 60)
+            print(f"  {name}: {frames} frames  {mins}m {secs:02d}s")
+        print("All done.")
+
+
+def _make_progress():
+    if _RICH:
+        return Progress(
+            SpinnerColumn(spinner_name="dots", style="bright_yellow"),
+            TextColumn("[bold white]{task.description}"),
+            BarColumn(bar_width=40, style="yellow", complete_style="bright_yellow"),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=_console,
+            refresh_per_second=10,
+        )
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Overlay persistent life-status tags on crowd footage."
     )
     parser.add_argument("videos", nargs="*",
                         help="Video files (default: all in ./webcamera/)")
-    parser.add_argument("--conf",  type=float, default=0.30)
-    parser.add_argument("--model", default="yolov8s.pt")
+    parser.add_argument("--conf",   type=float, default=0.25,
+                        help="Detection confidence threshold (default 0.25)")
+    parser.add_argument("--model",  default="yolov8m.pt",
+                        help="YOLO model weights (default yolov8m — better for crowds)")
+    parser.add_argument("--imgsz",  type=int, default=1280,
+                        help="Input resolution for YOLO (default 1280 — catches small people)")
+    parser.add_argument("--tile",   action="store_true",
+                        help="Tiled inference: slice frame into overlapping patches "
+                             "(best for very dense crowds; requires `pip install supervision`)")
+    parser.add_argument("--augment", action="store_true",
+                        help="Test-time augmentation — slower but higher recall")
     parser.add_argument("--print-map", action="store_true",
                         help="Print the full person→quote hashmap and exit")
     args = parser.parse_args()
+
+    if args.tile and not _SV:
+        print("WARNING: --tile requires `pip install supervision`. Falling back to standard mode.")
+        args.tile = False
+
+    _print_banner()
 
     hashmap = PersonHashMap()
 
@@ -585,26 +816,54 @@ def main():
     if args.videos:
         input_files = [Path(v) for v in args.videos]
     else:
-        vdir       = Path(__file__).parent / "webcamera"
-        exts       = {".mp4", ".mov", ".avi", ".mkv", ".MP4", ".MOV", ".AVI"}
+        vdir        = Path(__file__).parent / "webcamera"
+        exts        = {".mp4", ".mov", ".avi", ".mkv", ".MP4", ".MOV", ".AVI"}
         input_files = sorted(f for f in vdir.iterdir()
                              if f.suffix in exts and not f.stem.startswith("tagged_"))
 
     if not input_files:
-        print("No videos found.")
+        (_console.print("[yellow]No videos found.[/yellow]") if _RICH
+         else print("No videos found."))
         return
 
-    print(f"Model  : {args.model}")
-    print(f"Output : {OUT_WIDTH}px wide · {OUT_FPS}fps")
-    print(f"Videos : {len(input_files)}\n")
+    # ── Load model with spinner ───────────────────────────────────────────────
+    if _RICH:
+        with _console.status(f"[bright_yellow]Loading {args.model}…[/bright_yellow]",
+                             spinner="dots"):
+            model = YOLO(args.model)
+        _console.print(f"[green]✓[/green] Model loaded: [bold]{args.model}[/bold]")
+    else:
+        print(f"Loading {args.model}…")
+        model = YOLO(args.model)
 
-    model = YOLO(args.model)
+    mode_str = ("tiled" if args.tile else f"imgsz={args.imgsz}") + \
+               (" +augment" if args.augment else "")
+    if _RICH:
+        _console.print(f"  Output  : [cyan]{OUT_WIDTH}px[/cyan] wide · "
+                       f"[cyan]{OUT_FPS}fps[/cyan]")
+        _console.print(f"  Mode    : [cyan]{mode_str}[/cyan]  "
+                       f"conf=[cyan]{args.conf}[/cyan]")
+        _console.print(f"  Videos  : [cyan]{len(input_files)}[/cyan]\n")
+    else:
+        print(f"Output : {OUT_WIDTH}px wide · {OUT_FPS}fps")
+        print(f"Mode   : {mode_str}  conf={args.conf}")
+        print(f"Videos : {len(input_files)}\n")
 
-    for video in input_files:
-        process_video(video, model, conf=args.conf, hashmap=hashmap)
+    # ── Process each video ────────────────────────────────────────────────────
+    summary = []
+    for i, video in enumerate(input_files, 1):
+        if _RICH:
+            _console.rule(f"[bold white]{i}/{len(input_files)}  {video.name}[/bold white]")
+        t0 = time.time()
+        out = process_video(video, model, conf=args.conf, hashmap=hashmap,
+                            tiled=args.tile, imgsz=args.imgsz, augment=args.augment)
+        elapsed = time.time() - t0
+        # process_video returns frame count via its own print; we track externally
+        # Collect frame count from out metadata isn't available, use a sentinel
+        summary.append((video.name, _last_frame_count, elapsed))
 
     hashmap.print_map()
-    print("All done.")
+    _print_summary(summary)
 
 
 if __name__ == "__main__":
