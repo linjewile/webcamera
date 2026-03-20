@@ -5,30 +5,34 @@ Reads crowd video footage, detects and tracks every person using YOLOv8,
 and overlays a persistent life-status tag above each person for as long
 as they stay in the frame.
 
-Re-identification strategy (three layers):
-  1. BoT-SORT tracker  — uses Kalman prediction + appearance ReID internally
-  2. Ghost buffer      — remembers lost tracks for GHOST_FRAMES frames;
-                         new detections are matched by appearance histogram
-                         + last-known position, so a person walking back into
-                         frame gets their original tag back
-  3. Tag registry      — tag/colour is keyed on track ID so it never changes
+PersonHashMap
+─────────────
+Every unique person detected gets a fingerprint derived from a quantised
+HSV histogram of their body crop.  The map  fingerprint → quote  is saved
+to  person_tags.json  next to this script so the same person across
+different video files always receives the same quote.
 
-Export: 3K wide (3072 px), 24 fps, H.264 via ffmpeg if available,
-        falling back to mp4v otherwise.
+The JSON file is human-readable — you can open it and edit any quote
+before re-running to customise what specific people say.
+
+Re-identification layers
+─────────────────────────
+  1. BoT-SORT      — Kalman + ReID features (frame-to-frame)
+  2. Ghost buffer  — remembers lost tracks for ~3 s; matches by appearance
+                     + last position when the person re-enters the frame
+  3. PersonHashMap — persistent cross-video identity via appearance hash
+
+Export: 3 072 px wide · 24 fps · H.264
 
 Usage:
     python crowd_tags.py                      # all videos in ./webcamera/
     python crowd_tags.py myvideo.mp4          # single file
-    python crowd_tags.py a.mp4 b.mov c.MP4   # multiple files
-
-    --conf   0.30   detection confidence (lower = more detections in crowds)
-    --model  yolov8s.pt   use a bigger model for better accuracy
-
-Requirements:
-    pip install ultralytics opencv-python pillow numpy
+    --conf  0.28   lower = catch more people in dense crowds
+    --model yolov8s.pt   better accuracy (slower)
 """
 
 import cv2
+import json
 import numpy as np
 import random
 import argparse
@@ -37,24 +41,23 @@ from ultralytics import YOLO
 from PIL import Image, ImageDraw, ImageFont
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Export settings
+#  Export
 # ─────────────────────────────────────────────────────────────────────────────
-OUT_WIDTH  = 3072   # 3K wide
-OUT_FPS    = 24
+OUT_WIDTH = 3072
+OUT_FPS   = 24
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Re-ID: ghost buffer settings
+#  Re-ID / ghost buffer
 # ─────────────────────────────────────────────────────────────────────────────
-GHOST_FRAMES      = 72   # frames to remember a lost track (3 s at 24 fps)
-REID_APP_WEIGHT   = 0.65  # weight of appearance similarity in matching score
-REID_IOU_WEIGHT   = 0.35  # weight of position overlap in matching score
-REID_MIN_SCORE    = 0.42  # minimum score to accept a re-ID match
+GHOST_FRAMES    = 72
+REID_APP_W      = 0.65
+REID_IOU_W      = 0.35
+REID_MIN_SCORE  = 0.42
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Life-status tags
 # ─────────────────────────────────────────────────────────────────────────────
 TAGS = [
-    # Work / money
     "just got fired",
     "got a promotion today",
     "secretly a millionaire",
@@ -65,7 +68,6 @@ TAGS = [
     "waiting on a job offer",
     "starting a startup",
     "about to be acquired",
-    # Relationships
     "first date tonight",
     "just got dumped",
     "getting married next week",
@@ -76,7 +78,6 @@ TAGS = [
     "about to propose",
     "just had a baby",
     "going through a divorce",
-    # Life moments
     "hasn't slept in 2 days",
     "just found out they're pregnant",
     "just got their heart broken",
@@ -87,7 +88,6 @@ TAGS = [
     "best day of their life",
     "worst week of their life",
     "just got diagnosed",
-    # Fun / absurd
     "thinks nobody knows",
     "main character",
     "side character",
@@ -106,31 +106,177 @@ TAGS = [
 ]
 
 PALETTES = [
-    ((15,  15,  15,  210), (255, 255, 255)),   # black / white
-    ((245, 245, 245, 215), (20,  20,  20 )),   # white / black
-    ((18,  22,  45,  215), (160, 190, 255)),   # dark-blue / soft-blue
-    ((42,  10,  10,  215), (255, 170, 170)),   # dark-red  / soft-red
-    ((8,   38,  18,  215), (130, 255, 170)),   # dark-green / soft-green
-    ((38,  26,  4,   215), (255, 210, 120)),   # dark-amber / soft-amber
+    ((15,  15,  15,  210), (255, 255, 255)),
+    ((245, 245, 245, 215), (20,  20,  20 )),
+    ((18,  22,  45,  215), (160, 190, 255)),
+    ((42,  10,  10,  215), (255, 170, 170)),
+    ((8,   38,  18,  215), (130, 255, 170)),
+    ((38,  26,  4,   215), (255, 210, 120)),
 ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Track state + ghost buffer  (reset per video)
+#  PersonHashMap
+#  Maps appearance fingerprint → {"quote": str, "palette": int, "seen": int}
+#  Persisted to person_tags.json so it survives across sessions.
+# ─────────────────────────────────────────────────────────────────────────────
+HASHMAP_PATH     = Path(__file__).parent / "person_tags.json"
+FINGERPRINT_BINS = (12, 5)    # hue bins, saturation bins  → 60-value vector
+MATCH_THRESHOLD  = 0.88       # cosine similarity to call two fingerprints the same person
+
+
+class PersonHashMap:
+    """
+    Stores  fingerprint_hex → {quote, palette_idx, seen_count}  in JSON.
+
+    Fingerprint
+    ───────────
+    Computed from the top-60% of a person's bounding box (torso — more
+    stable than legs or head).  A 12×5 HSV histogram is computed,
+    L2-normalised, then each value is quantised to a 2-digit hex byte
+    and concatenated into a ~120-char hex string.
+
+    Matching
+    ────────
+    Cosine similarity between two float32 histogram vectors.
+    If similarity ≥ MATCH_THRESHOLD the person is considered the same.
+    When multiple stored entries match, the closest one wins.
+    """
+
+    def __init__(self, path: Path = HASHMAP_PATH):
+        self.path    = path
+        self._map: dict[str, dict] = {}        # hex_key → record
+        self._vecs: dict[str, np.ndarray] = {} # hex_key → float32 vector (cached)
+        self._load()
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def _load(self):
+        if self.path.exists():
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._map = json.load(f)
+                # Rebuild float vector cache
+                for key, rec in self._map.items():
+                    if "vec" in rec:
+                        self._vecs[key] = np.array(rec["vec"], dtype=np.float32)
+            except (json.JSONDecodeError, KeyError):
+                self._map = {}
+        print(f"  PersonHashMap: {len(self._map)} known person(s) loaded from {self.path.name}")
+
+    def save(self):
+        # Embed the float vector in the JSON so we can reconstruct on reload
+        for key, rec in self._map.items():
+            if key in self._vecs:
+                rec["vec"] = self._vecs[key].tolist()
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self._map, f, indent=2, ensure_ascii=False)
+
+    def print_map(self):
+        """Pretty-print the full hashmap to the console."""
+        print(f"\n{'─'*60}")
+        print(f"  PersonHashMap  ({len(self._map)} entries)  →  {self.path.name}")
+        print(f"{'─'*60}")
+        for i, (key, rec) in enumerate(self._map.items(), 1):
+            seen = rec.get("seen", 1)
+            print(f"  {i:>3}.  {key[:24]}...  "
+                  f"seen:{seen:>4}x  \"{rec['quote']}\"")
+        print(f"{'─'*60}\n")
+
+    # ── fingerprinting ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_vec(crop_bgr: np.ndarray) -> np.ndarray | None:
+        """
+        Returns an L2-normalised float32 vector from the torso portion
+        of a person crop.  Returns None if the crop is too small.
+        """
+        h, w = crop_bgr.shape[:2]
+        if h < 20 or w < 10:
+            return None
+
+        # Use only the top 60% (torso — clothing is stable; legs vary)
+        torso = crop_bgr[:int(h * 0.6), :]
+
+        hsv  = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist(
+            [hsv], [0, 1], None,
+            [FINGERPRINT_BINS[0], FINGERPRINT_BINS[1]],
+            [0, 180, 0, 256],
+        )
+        vec = hist.flatten().astype(np.float32)
+
+        # L2 normalise
+        norm = np.linalg.norm(vec)
+        if norm < 1e-6:
+            return None
+        return vec / norm
+
+    @staticmethod
+    def _vec_to_key(vec: np.ndarray) -> str:
+        """Quantise each float to 0-255 and encode as hex string."""
+        quantised = np.clip(vec * 255, 0, 255).astype(np.uint8)
+        return quantised.tobytes().hex()
+
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.dot(a, b))  # both already L2-normalised
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    def get_quote(self, crop_bgr: np.ndarray) -> tuple[str, int] | None:
+        """
+        Return (quote, palette_idx) for this crop, or None if crop too small.
+        Creates a new entry if no match found.
+        """
+        vec = self._compute_vec(crop_bgr)
+        if vec is None:
+            return None
+
+        # Search existing entries for a close match
+        best_key, best_sim = None, MATCH_THRESHOLD - 1e-9
+        for stored_key, stored_vec in self._vecs.items():
+            sim = self._cosine(vec, stored_vec)
+            if sim > best_sim:
+                best_sim, best_key = sim, stored_key
+
+        if best_key is not None:
+            # Found — update the running average vector for drift robustness
+            avg = self._vecs[best_key] * 0.9 + vec * 0.1
+            avg /= (np.linalg.norm(avg) + 1e-9)
+            self._vecs[best_key] = avg
+            self._map[best_key]["seen"] = self._map[best_key].get("seen", 1) + 1
+            return self._map[best_key]["quote"], self._map[best_key]["palette_idx"]
+
+        # New person — assign quote + palette
+        new_key = self._vec_to_key(vec)
+        palette_idx = random.randrange(len(PALETTES))
+        self._map[new_key]  = {
+            "quote":       random.choice(TAGS),
+            "palette_idx": palette_idx,
+            "seen":        1,
+        }
+        self._vecs[new_key] = vec
+        self.save()
+        return self._map[new_key]["quote"], palette_idx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Track state + ghost buffer  (per-video)
 # ─────────────────────────────────────────────────────────────────────────────
 class TrackState:
     __slots__ = ("tag", "palette", "last_box", "last_frame", "appearance")
 
-    def __init__(self):
-        self.tag        = random.choice(TAGS)
-        self.palette    = random.choice(PALETTES)
-        self.last_box   = None   # (x1,y1,x2,y2) in detection-resolution coords
+    def __init__(self, tag: str, palette_idx: int):
+        self.tag        = tag
+        self.palette    = PALETTES[palette_idx]
+        self.last_box   = None
         self.last_frame = 0
-        self.appearance = None   # HSV histogram ndarray
+        self.appearance = None
 
 
-_registry: dict[int, TrackState] = {}  # active tracks
-_ghosts:   dict[int, TrackState] = {}  # recently-lost tracks
+_registry: dict[int, TrackState] = {}
+_ghosts:   dict[int, TrackState] = {}
 
 
 def _reset_state():
@@ -139,17 +285,13 @@ def _reset_state():
 
 
 def _get_state(track_id: int) -> TrackState:
-    if track_id not in _registry:
-        _registry[track_id] = TrackState()
     return _registry[track_id]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Appearance + position helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def _appearance(frame: np.ndarray, x1, y1, x2, y2) -> np.ndarray | None:
-    """16-bin HSV hue + 8-bin saturation histogram of the person crop."""
-    crop = frame[max(0,y1):max(0,y2), max(0,x1):max(0,x2)]
+# ── appearance helpers ────────────────────────────────────────────────────────
+
+def _appearance_hist(frame: np.ndarray, x1, y1, x2, y2) -> np.ndarray | None:
+    crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
     if crop.size == 0:
         return None
     hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -174,54 +316,57 @@ def _iou(a, b) -> float:
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
     if inter == 0:
         return 0.0
-    area_a = (a[2]-a[0]) * (a[3]-a[1])
-    area_b = (b[2]-b[0]) * (b[3]-b[1])
-    return inter / (area_a + area_b - inter)
+    ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
 
 
 def _expire_ghosts(current_frame: int):
-    expired = [gid for gid, gs in _ghosts.items()
-               if current_frame - gs.last_frame > GHOST_FRAMES]
-    for gid in expired:
-        del _ghosts[gid]
+    dead = [k for k, gs in _ghosts.items()
+            if current_frame - gs.last_frame > GHOST_FRAMES]
+    for k in dead:
+        del _ghosts[k]
 
 
-def _match_ghost(box, appearance, current_frame: int) -> int | None:
-    """Return the ghost track_id that best matches this new detection, or None."""
+def _match_ghost(box, app, current_frame: int) -> int | None:
     _expire_ghosts(current_frame)
     best_id, best_score = None, REID_MIN_SCORE
     for gid, gs in _ghosts.items():
         if gs.last_box is None:
             continue
-        score = (REID_APP_WEIGHT * _app_sim(appearance, gs.appearance)
-                 + REID_IOU_WEIGHT * _iou(box, gs.last_box))
+        score = REID_APP_W * _app_sim(app, gs.appearance) + REID_IOU_W * _iou(box, gs.last_box)
         if score > best_score:
             best_score, best_id = score, gid
     return best_id
 
 
-def _on_track_seen(track_id: int, box, frame: np.ndarray, frame_idx: int):
-    """Called every frame a track is visible — updates state and resolves ghost."""
-    # If this is a brand-new ID, check the ghost buffer first
+def _on_track_seen(track_id: int, box, frame: np.ndarray,
+                   frame_idx: int, hashmap: PersonHashMap):
+    x1, y1, x2, y2 = box
+    crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+
     if track_id not in _registry:
-        x1, y1, x2, y2 = box
-        app   = _appearance(frame, x1, y1, x2, y2)
+        app   = _appearance_hist(frame, x1, y1, x2, y2)
         ghost = _match_ghost(box, app, frame_idx)
+
         if ghost is not None:
-            # Resurrect old state under new tracker ID
+            # Resurrect state from ghost buffer
             _registry[track_id] = _ghosts.pop(ghost)
         else:
-            _registry[track_id] = TrackState()
+            # Ask the hashmap for a persistent quote
+            result = hashmap.get_quote(crop) if crop.size > 0 else None
+            if result:
+                tag, pal = result
+            else:
+                tag, pal = random.choice(TAGS), random.randrange(len(PALETTES))
+            _registry[track_id] = TrackState(tag, pal)
 
     state = _registry[track_id]
-    x1, y1, x2, y2 = box
     state.last_box   = box
     state.last_frame = frame_idx
-    state.appearance = _appearance(frame, x1, y1, x2, y2)
+    state.appearance = _appearance_hist(frame, x1, y1, x2, y2)
 
 
 def _on_track_lost(track_id: int):
-    """Move a track to the ghost buffer when the tracker drops it."""
     if track_id in _registry:
         _ghosts[track_id] = _registry.pop(track_id)
 
@@ -266,96 +411,79 @@ def _rounded_rect(draw, x0, y0, x1, y1, r, fill):
 
 
 def render_tags(frame_bgr: np.ndarray, detections: list) -> np.ndarray:
-    """detections: list of (track_id, x1, y1, x2, y2) in frame coords."""
     if not detections:
         return frame_bgr
 
-    h, w   = frame_bgr.shape[:2]
-    fsize  = max(20, int(h / 38))
-    font   = _font(fsize)
+    h, w  = frame_bgr.shape[:2]
+    fsize = max(20, int(h / 38))
+    font  = _font(fsize)
 
     base    = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw    = ImageDraw.Draw(overlay)
 
     for track_id, x1, y1, x2, y2 in detections:
-        state          = _get_state(track_id)
+        if track_id not in _registry:
+            continue
+        state           = _get_state(track_id)
         bg_rgba, tx_rgb = state.palette
 
-        # Measure tag text
         tb     = font.getbbox(state.tag)
-        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        tw, th = tb[2]-tb[0], tb[3]-tb[1]
 
-        cx       = (x1 + x2) // 2
-        pill_w   = tw + 2 * PAD_X
-        pill_h   = th + 2 * PAD_Y
-        pill_x0  = int(max(4, min(cx - pill_w // 2, w - pill_w - 4)))
-        pill_y0  = int(max(4, y1 - pill_h - 20))
-        pill_x1  = pill_x0 + pill_w
-        pill_y1  = pill_y0 + pill_h
+        cx      = (x1 + x2) // 2
+        pill_w  = tw + 2 * PAD_X
+        pill_h  = th + 2 * PAD_Y
+        pill_x0 = int(max(4, min(cx - pill_w // 2, w - pill_w - 4)))
+        pill_y0 = int(max(4, y1 - pill_h - 20))
+        pill_x1 = pill_x0 + pill_w
+        pill_y1 = pill_y0 + pill_h
 
-        # Connector line + dot
         draw.line([(cx, y1), (cx, pill_y1)], fill=LINE_C, width=2)
         r = 5
         draw.ellipse([cx-r, y1-r, cx+r, y1+r], fill=(*tx_rgb, 230))
-
-        # Pill + text
         _rounded_rect(draw, pill_x0, pill_y0, pill_x1, pill_y1, RADIUS, bg_rgba)
         draw.text((pill_x0 + PAD_X, pill_y0 + PAD_Y), state.tag,
                   font=font, fill=(*tx_rgb, 255))
-
-        # Subtle person box
         draw.rectangle([x1, y1, x2, y2], outline=(*tx_rgb, 100), width=2)
 
-    return cv2.cvtColor(np.array(Image.alpha_composite(base, overlay).convert("RGB")),
-                        cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor(
+        np.array(Image.alpha_composite(base, overlay).convert("RGB")),
+        cv2.COLOR_RGB2BGR,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  3K upscale helper
+#  3K scaling + writer
 # ─────────────────────────────────────────────────────────────────────────────
 def scale_to_3k(frame: np.ndarray) -> np.ndarray:
-    """Scale frame so width == OUT_WIDTH (3072), maintaining aspect ratio."""
     h, w = frame.shape[:2]
     if w == OUT_WIDTH:
         return frame
-    new_w = OUT_WIDTH
     new_h = int(round(h * OUT_WIDTH / w))
-    # Use INTER_LANCZOS4 for upscale (sharp), INTER_AREA for downscale (smooth)
     interp = cv2.INTER_LANCZOS4 if w < OUT_WIDTH else cv2.INTER_AREA
-    return cv2.resize(frame, (new_w, new_h), interpolation=interp)
+    return cv2.resize(frame, (OUT_WIDTH, new_h), interpolation=interp)
 
 
-def scale_boxes(detections, src_w, src_h, dst_w, dst_h):
-    """Scale bounding boxes from detection resolution to output resolution."""
-    sx = dst_w / src_w
-    sy = dst_h / src_h
-    return [(tid,
-             int(x1*sx), int(y1*sy),
-             int(x2*sx), int(y2*sy))
-            for tid, x1, y1, x2, y2 in detections]
+def scale_boxes(dets, sw, sh, dw, dh):
+    sx, sy = dw / sw, dh / sh
+    return [(t, int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
+            for t, x1, y1, x2, y2 in dets]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Video writer (H.264 via ffmpeg if available, mp4v fallback)
-# ─────────────────────────────────────────────────────────────────────────────
 def make_writer(path: Path, w: int, h: int) -> cv2.VideoWriter:
-    for fourcc_str in ("avc1", "H264", "mp4v"):
-        writer = cv2.VideoWriter(
-            str(path),
-            cv2.VideoWriter_fourcc(*fourcc_str),
-            OUT_FPS,
-            (w, h),
-        )
-        if writer.isOpened():
-            return writer
-    raise RuntimeError("Could not open VideoWriter with any codec.")
+    for fc in ("avc1", "H264", "mp4v"):
+        wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*fc), OUT_FPS, (w, h))
+        if wr.isOpened():
+            return wr
+    raise RuntimeError("Could not open VideoWriter.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Core: process one video
+#  Process one video
 # ─────────────────────────────────────────────────────────────────────────────
-def process_video(input_path: Path, model: YOLO, conf: float) -> Path | None:
+def process_video(input_path: Path, model: YOLO,
+                  conf: float, hashmap: PersonHashMap) -> Path | None:
     _reset_state()
 
     cap = cv2.VideoCapture(str(input_path))
@@ -368,46 +496,35 @@ def process_video(input_path: Path, model: YOLO, conf: float) -> Path | None:
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Output dimensions after 3K scaling
-    out_h = int(round(src_h * OUT_WIDTH / src_w))
-    out_w = OUT_WIDTH
-
+    out_h    = int(round(src_h * OUT_WIDTH / src_w))
     out_path = input_path.parent / f"tagged_{input_path.stem}.mp4"
-    writer   = make_writer(out_path, out_w, out_h)
+    writer   = make_writer(out_path, OUT_WIDTH, out_h)
 
-    # Frame step: skip frames if source fps > 24 so output is smooth 24fps
     frame_step = max(1, round(src_fps / OUT_FPS))
 
     print(f"  {input_path.name}")
-    print(f"    Source  : {src_w}x{src_h} @ {src_fps:.1f}fps  ({total} frames)")
-    print(f"    Output  : {out_w}x{out_h} @ {OUT_FPS}fps  → {out_path.name}")
+    print(f"    Source : {src_w}x{src_h} @ {src_fps:.1f}fps  ({total} frames)")
+    print(f"    Output : {OUT_WIDTH}x{out_h} @ {OUT_FPS}fps")
 
-    active_ids_prev: set[int] = set()
-    frame_idx  = 0
-    write_idx  = 0
+    prev_ids: set[int] = set()
+    frame_idx = write_idx = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Only process every Nth source frame to hit 24 fps output
         if frame_idx % frame_step != 0:
             frame_idx += 1
             continue
 
-        # ── YOLO BoT-SORT tracking ──────────────────────────────────────────
         results = model.track(
-            frame,
-            persist=True,
-            classes=[0],               # persons only
-            conf=conf,
-            verbose=False,
-            tracker="botsort.yaml",    # ReID-aware tracker
+            frame, persist=True, classes=[0],
+            conf=conf, verbose=False, tracker="botsort.yaml",
         )
 
-        detections      = []
-        active_ids_curr = set()
+        detections = []
+        curr_ids   = set()
 
         for r in results:
             if r.boxes is None:
@@ -418,32 +535,29 @@ def process_video(input_path: Path, model: YOLO, conf: float) -> Path | None:
                 tid          = int(box.id[0])
                 x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
                 detections.append((tid, x1, y1, x2, y2))
-                active_ids_curr.add(tid)
-                _on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx)
+                curr_ids.add(tid)
+                _on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx, hashmap)
 
-        # Move dropped tracks to ghost buffer
-        for lost_id in active_ids_prev - active_ids_curr:
-            _on_track_lost(lost_id)
-        active_ids_prev = active_ids_curr
+        for lost in prev_ids - curr_ids:
+            _on_track_lost(lost)
+        prev_ids = curr_ids
 
-        # ── Scale frame to 3K, scale boxes, render ──────────────────────────
-        frame_3k       = scale_to_3k(frame)
-        out_h_actual, out_w_actual = frame_3k.shape[:2]
-        dets_scaled    = scale_boxes(detections, src_w, src_h,
-                                     out_w_actual, out_h_actual)
-        tagged         = render_tags(frame_3k, dets_scaled)
-
+        frame_3k   = scale_to_3k(frame)
+        oh, ow     = frame_3k.shape[:2]
+        dets_sc    = scale_boxes(detections, src_w, src_h, ow, oh)
+        tagged     = render_tags(frame_3k, dets_sc)
         writer.write(tagged)
-        write_idx += 1
 
+        write_idx += 1
         frame_idx += 1
         if write_idx % 24 == 0:
             pct = frame_idx / total * 100 if total else 0
-            print(f"    {write_idx} output frames  ({pct:.0f}%)", end="\r")
+            print(f"    {write_idx} frames written  ({pct:.0f}%)", end="\r")
 
     cap.release()
     writer.release()
-    print(f"\n  Saved → {out_path.name}  ({write_idx} frames @ {OUT_FPS}fps, {out_w}x{out_h})")
+    hashmap.save()
+    print(f"\n  Saved → {out_path.name}  ({write_idx} frames)")
     return out_path
 
 
@@ -452,40 +566,45 @@ def process_video(input_path: Path, model: YOLO, conf: float) -> Path | None:
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Overlay persistent life-status tags on every person in crowd footage."
+        description="Overlay persistent life-status tags on crowd footage."
     )
     parser.add_argument("videos", nargs="*",
-                        help="Video files to process (default: all in ./webcamera/)")
-    parser.add_argument("--conf",  type=float, default=0.30,
-                        help="Detection confidence threshold (default 0.30)")
-    parser.add_argument("--model", default="yolov8s.pt",
-                        help="YOLO weights — yolov8n.pt (fast) or yolov8s.pt (accurate)")
+                        help="Video files (default: all in ./webcamera/)")
+    parser.add_argument("--conf",  type=float, default=0.30)
+    parser.add_argument("--model", default="yolov8s.pt")
+    parser.add_argument("--print-map", action="store_true",
+                        help="Print the full person→quote hashmap and exit")
     args = parser.parse_args()
+
+    hashmap = PersonHashMap()
+
+    if args.print_map:
+        hashmap.print_map()
+        return
 
     if args.videos:
         input_files = [Path(v) for v in args.videos]
     else:
-        video_dir   = Path(__file__).parent / "webcamera"
-        extensions  = {".mp4", ".mov", ".avi", ".mkv", ".MP4", ".MOV", ".AVI"}
-        input_files = sorted(
-            f for f in video_dir.iterdir()
-            if f.suffix in extensions and not f.stem.startswith("tagged_")
-        )
+        vdir       = Path(__file__).parent / "webcamera"
+        exts       = {".mp4", ".mov", ".avi", ".mkv", ".MP4", ".MOV", ".AVI"}
+        input_files = sorted(f for f in vdir.iterdir()
+                             if f.suffix in exts and not f.stem.startswith("tagged_"))
 
     if not input_files:
-        print("No videos found. Pass paths or put videos in the webcamera/ folder.")
+        print("No videos found.")
         return
 
-    print(f"Loading model : {args.model}")
+    print(f"Model  : {args.model}")
+    print(f"Output : {OUT_WIDTH}px wide · {OUT_FPS}fps")
+    print(f"Videos : {len(input_files)}\n")
+
     model = YOLO(args.model)
 
-    print(f"Output        : {OUT_WIDTH}px wide, {OUT_FPS}fps")
-    print(f"Videos        : {len(input_files)}\n")
-
     for video in input_files:
-        process_video(video, model, conf=args.conf)
+        process_video(video, model, conf=args.conf, hashmap=hashmap)
 
-    print("\nAll done.")
+    hashmap.print_map()
+    print("All done.")
 
 
 if __name__ == "__main__":
