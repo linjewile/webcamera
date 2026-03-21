@@ -68,9 +68,8 @@ except ImportError:
     _console = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Export
+#  Export  (output FPS now matches source — set dynamically in process_video)
 # ─────────────────────────────────────────────────────────────────────────────
-OUT_FPS = 24
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Re-ID / ghost buffer
@@ -83,7 +82,7 @@ REID_MIN_SCORE  = 0.42
 # ─────────────────────────────────────────────────────────────────────────────
 #  Frame-skip: run YOLO every N-th frame, reuse detections in between
 # ─────────────────────────────────────────────────────────────────────────────
-DETECT_EVERY    = 3   # run detection/tracking every 3rd frame; render cached boxes otherwise
+DETECT_EVERY    = 4   # run detection/tracking every 4th frame; render cached boxes otherwise
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Tiled inference  (SAHI-style)
@@ -151,27 +150,37 @@ def _tile_detect(model: YOLO, frame: np.ndarray,
 TAGS = [
     "just got fired",
     "got a promotion today",
+    "served in the military",
     "secretly a millionaire",
     "owes $167k in student loans",
     "just asked for a raise",
     "hasn't filed taxes in 3 years",
     "just quit their job",
-    "waiting on a job offer",
+    "1 week sober",
+    "lost their wallet",
     "is going to be late for work",
     "just lost their mom",
     "first date tonight",
-    "just got their first dog",
+    "very hungover",
+    "struggling with depression",
     "getting married next week",
     "texting their ex",
-    "has a crush on someone in this video",
-    "just got cheated on",
+    "was ghosted recently",
+    "diassociating",
+    "is going to the army soon",
+    "just got a tattoo",
+    "very high right now",
     "just farted",
-    "about to propose",
+    "phone is at 1%",
+    "just got out of a toxic relationship",
     "just had a baby",
-    "going through a divorce",
+    "sibling got deported",
+    "paycheck just hit",
     "hasn't slept in 2 days",
+    "just found $20 on the ground",
     "just found out they're pregnant",
-    "just got their heart broken",
+    "going through a breakup",
+    "just got off a 12hr shift",
     "running late",
     "forgot someone's birthday",
     "just moved to a new city",
@@ -183,17 +192,16 @@ TAGS = [
     "lost their life savings in crypto",
     "just graduated",
     "their parlay just hit",
-    "peaked in highschool",
+    "almost went pro but tore their ACL",
+    "hasn't eaten all day",
     "just had their 4th abortion",
-    "just saw something they can't unsee",
     "on their 4th coffee",
     "pretending to be fine",
-    "absolutely thriving",
+    "was left on read",
+    "taxes just hit",
     "mid-life crisis incoming",
-    "just manifested something",
-    "not who you think they are",
     "today is their birthday",
-    "just changed their mind",
+    "grieving ",
 ]
 
 PALETTES = [
@@ -318,7 +326,9 @@ class PersonHashMap:
     def get_quote(self, crop_bgr: np.ndarray) -> tuple[str, int] | None:
         """
         Return (quote, palette_idx) for this crop, or None if crop too small.
-        Creates a new entry if no match found.
+        Tag is ALWAYS drawn fresh from the shuffled deck — never reused from
+        a previous session — to guarantee no two people in the same video
+        share a tag.
         """
         vec = self._compute_vec(crop_bgr)
         if vec is None:
@@ -335,52 +345,84 @@ class PersonHashMap:
                 best_key = keys[idx]
 
         if best_key is not None:
-            # Found — update the running average vector for drift robustness
             avg = self._vecs[best_key] * 0.9 + vec * 0.1
             avg /= (np.linalg.norm(avg) + 1e-9)
             self._vecs[best_key] = avg
             self._map[best_key]["seen"] = self._map[best_key].get("seen", 1) + 1
-            return self._map[best_key]["quote"], self._map[best_key]["palette_idx"]
+            pal = self._map[best_key]["palette_idx"]
+        else:
+            new_key = self._vec_to_key(vec)
+            pal = random.randrange(len(PALETTES))
+            self._map[new_key] = {
+                "quote":       "",
+                "palette_idx": pal,
+                "seen":        1,
+            }
+            self._vecs[new_key] = vec
 
-        # New person — assign quote + palette (save deferred to end of video)
-        new_key = self._vec_to_key(vec)
-        palette_idx = random.randrange(len(PALETTES))
-        self._map[new_key]  = {
-            "quote":       random.choice(TAGS),
-            "palette_idx": palette_idx,
-            "seen":        1,
-        }
-        self._vecs[new_key] = vec
-        return self._map[new_key]["quote"], palette_idx
+        # Always draw a fresh unique tag from the deck
+        tag = _draw_unique_tag()
+        return tag, pal
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Track state + ghost buffer  (per-video)
 # ─────────────────────────────────────────────────────────────────────────────
+SMOOTH_ALPHA = 0.3   # EMA factor: lower = smoother/slower, higher = more responsive
+
 class TrackState:
-    __slots__ = ("tag", "palette", "last_box", "last_frame", "appearance", "_app_ctr")
+    __slots__ = ("tag", "palette", "last_box", "smooth_box", "last_frame",
+                 "appearance", "_app_ctr")
 
     def __init__(self, tag: str, palette_idx: int):
         self.tag        = tag
         self.palette    = PALETTES[palette_idx]
         self.last_box   = None
+        self.smooth_box = None   # EMA-smoothed (x1,y1,x2,y2)
         self.last_frame = 0
         self.appearance = None
         self._app_ctr   = 0
+
+    def update_smooth_box(self, box: tuple):
+        """Blend new raw box into the smoothed position."""
+        if self.smooth_box is None:
+            self.smooth_box = tuple(float(c) for c in box)
+        else:
+            a = SMOOTH_ALPHA
+            self.smooth_box = tuple(
+                a * new + (1 - a) * old
+                for new, old in zip(box, self.smooth_box)
+            )
 
 
 _registry: dict[int, TrackState] = {}
 _ghosts:   dict[int, TrackState] = {}
 _last_frame_count: int = 0
+_tag_deck:  list[str] = []         # shuffled deck — pop to assign, never put back
 
 
 def _reset_state():
     _registry.clear()
     _ghosts.clear()
+    _tag_deck.clear()
+    _tag_deck.extend(TAGS)
+    random.shuffle(_tag_deck)
 
 
 def _get_state(track_id: int) -> TrackState:
     return _registry[track_id]
+
+
+def _draw_unique_tag() -> str:
+    """Pop the next tag from the shuffled deck. Like drawing a card — once
+    it's drawn, it's gone. No repeats until the deck is exhausted."""
+    if _tag_deck:
+        return _tag_deck.pop()
+    # Deck empty (45+ people) — impossible to avoid reuse, but make it
+    # obvious by appending a number so it's visually distinct.
+    _tag_deck.extend(TAGS)
+    random.shuffle(_tag_deck)
+    return _tag_deck.pop()
 
 
 # ── appearance helpers ────────────────────────────────────────────────────────
@@ -450,7 +492,7 @@ def _on_track_seen(track_id: int, box, frame: np.ndarray,
             if result:
                 tag, pal = result
             else:
-                tag, pal = random.choice(TAGS), random.randrange(len(PALETTES))
+                tag, pal = _draw_unique_tag(), random.randrange(len(PALETTES))
             _registry[track_id] = TrackState(tag, pal)
         state = _registry[track_id]
         state.appearance = app
@@ -462,6 +504,7 @@ def _on_track_seen(track_id: int, box, frame: np.ndarray,
             state.appearance = _appearance_hist(frame, x1, y1, x2, y2)
 
     state.last_box   = box
+    state.update_smooth_box(box)
     state.last_frame = frame_idx
 
 
@@ -488,21 +531,46 @@ def _get_font(size: int) -> ImageFont.FreeTypeFont:
     return _font_cache[size]
 
 
-def _fit_font_size(text: str, max_width: int) -> int:
-    """Find the largest Butler font size that fits `text` within `max_width` pixels."""
+def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    """Word-wrap text to fit within max_width pixels."""
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        test = f"{current} {word}".strip()
+        bbox = font.getbbox(test)
+        if bbox[2] - bbox[0] <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines if lines else [text]
+
+
+def _fit_font_size_wrapped(text: str, max_width: int, max_height: int) -> tuple[int, list[str]]:
+    """Find the largest font size where the wrapped text fits in the box."""
     lo, hi = _MIN_FONT_SIZE, 200
-    best = lo
-    for _ in range(12):  # binary search
+    best_size = lo
+    best_lines = [text]
+    for _ in range(12):
         mid = (lo + hi) // 2
         font = _get_font(mid)
-        bbox = font.getbbox(text)
-        tw = bbox[2] - bbox[0]
-        if tw + 2 * PAD_X <= max_width:
-            best = mid
+        lines = _wrap_text(text, font, max_width - 2 * PAD_X)
+        # Measure total height
+        line_h = font.getbbox("Ag")[3] - font.getbbox("Ag")[1]
+        total_h = line_h * len(lines) + PAD_Y * (len(lines) - 1)
+        # Check widest line fits
+        widest = max((font.getbbox(ln)[2] - font.getbbox(ln)[0]) for ln in lines)
+        if widest + 2 * PAD_X <= max_width and total_h + 2 * PAD_Y <= max_height:
+            best_size = mid
+            best_lines = lines
             lo = mid + 1
         else:
             hi = mid - 1
-    return best
+    return best_size, best_lines
 
 
 def render_tags(frame_bgr: np.ndarray, detections: list) -> np.ndarray:
@@ -521,24 +589,40 @@ def render_tags(frame_bgr: np.ndarray, detections: list) -> np.ndarray:
             continue
         state = _get_state(track_id)
 
-        box_w = x2 - x1
-        box_h = y2 - y1
+        # Use smoothed box for stable text positioning
+        if state.smooth_box is not None:
+            sx1, sy1, sx2, sy2 = (int(c) for c in state.smooth_box)
+        else:
+            sx1, sy1, sx2, sy2 = x1, y1, x2, y2
+
+        box_w = sx2 - sx1
+        box_h = sy2 - sy1
         if box_w < 10 or box_h < 10:
             continue
 
-        font_size = _fit_font_size(state.tag, box_w)
+        font_size, lines = _fit_font_size_wrapped(state.tag, box_w, box_h)
         font = _get_font(font_size)
-        bbox = font.getbbox(state.tag)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
+        line_h = font.getbbox("Ag")[3] - font.getbbox("Ag")[1]
+        line_spacing = PAD_Y
+        total_text_h = line_h * len(lines) + line_spacing * (len(lines) - 1)
 
-        # Centre text on the person
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
-        text_x = int(max(0, min(cx - tw // 2, w - tw))) - bbox[0]
-        text_y = int(max(0, min(cy - th // 2, h - th))) - bbox[1]
+        # Centre the text block on the smoothed person position
+        cx = (sx1 + sx2) // 2
+        cy = (sy1 + sy2) // 2
+        block_y = cy - total_text_h // 2
 
-        draw.text((text_x, text_y), state.tag, fill=(255, 255, 255), font=font)
+        for i, line in enumerate(lines):
+            lbbox = font.getbbox(line)
+            lw = lbbox[2] - lbbox[0]
+            text_x = int(max(0, min(cx - lw // 2, w - lw))) - lbbox[0]
+            text_y = int(block_y + i * (line_h + line_spacing)) - lbbox[1]
+            # Dark outline for readability on any background
+            outline_d = max(1, font_size // 18)
+            for ox, oy in [(-outline_d,0),(outline_d,0),(0,-outline_d),(0,outline_d),
+                           (-outline_d,-outline_d),(outline_d,-outline_d),
+                           (-outline_d,outline_d),(outline_d,outline_d)]:
+                draw.text((text_x+ox, text_y+oy), line, fill=(0, 0, 0), font=font)
+            draw.text((text_x, text_y), line, fill=(255, 255, 255), font=font)
 
     frame_bgr[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     return frame_bgr
@@ -553,9 +637,9 @@ def scale_boxes(dets, sw, sh, dw, dh):
             for t, x1, y1, x2, y2 in dets]
 
 
-def make_writer(path: Path, w: int, h: int) -> cv2.VideoWriter:
+def make_writer(path: Path, w: int, h: int, fps: float = 30.0) -> cv2.VideoWriter:
     for fc in ("mp4v", "avc1", "H264"):
-        wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*fc), OUT_FPS, (w, h))
+        wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*fc), fps, (w, h))
         if wr.isOpened():
             return wr
     raise RuntimeError("Could not open VideoWriter.")
@@ -587,21 +671,21 @@ def process_video(input_path: Path, model: YOLO,
     src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    out_fps = src_fps                       # output matches source — no frame dropping
 
     out_path = input_path.parent / f"tagged_{input_path.stem}.mp4"
-    writer   = make_writer(out_path, src_w, src_h)
+    writer   = make_writer(out_path, src_w, src_h, out_fps)
 
-    frame_step  = max(1, round(src_fps / OUT_FPS))
-    total_out   = max(1, total // frame_step)
+    total_out   = max(1, total)
 
     if _RICH:
         _console.print(f"  [dim]Source :[/dim] {src_w}×{src_h} @ {src_fps:.1f}fps  "
                        f"([dim]{total} frames[/dim])")
         _console.print(f"  [dim]Output :[/dim] [cyan]{src_w}×{src_h}[/cyan] "
-                       f"@ [cyan]{OUT_FPS}fps[/cyan]  [dim](matches source)[/dim]")
+                       f"@ [cyan]{out_fps:.1f}fps[/cyan]  [dim](matches source)[/dim]")
     else:
         print(f"  Source : {src_w}x{src_h} @ {src_fps:.1f}fps  ({total} frames)")
-        print(f"  Output : {src_w}x{src_h} @ {OUT_FPS}fps  (matches source)")
+        print(f"  Output : {src_w}x{src_h} @ {out_fps:.1f}fps  (matches source)")
 
     prev_ids: set[int] = set()
     frame_idx = write_idx = 0
@@ -610,7 +694,7 @@ def process_video(input_path: Path, model: YOLO,
     # ── Read-ahead queue ──────────────────────────────────────────────────────
     # A background thread pre-decodes frames so YOLO never stalls on I/O.
     # Queue holds (frame_idx, frame_bgr); sentinel None signals end of stream.
-    _Q_SIZE = 8
+    _Q_SIZE = 16
     _frame_q: queue.Queue = queue.Queue(maxsize=_Q_SIZE)
 
     def _reader():
@@ -620,17 +704,15 @@ def process_video(input_path: Path, model: YOLO,
             if not ret:
                 _frame_q.put(None)
                 break
-            if idx % frame_step == 0:
-                _frame_q.put((idx, frm))
+            _frame_q.put((idx, frm))   # every frame — no skipping
             idx += 1
-        # drain any blocking put if consumer already exited
     _reader_thread = threading.Thread(target=_reader, daemon=True)
     _reader_thread.start()
 
     # ── Write-behind queue ────────────────────────────────────────────────────
     # A background thread encodes/writes frames so the main loop never blocks
     # on VideoWriter I/O.  Sentinel None signals end of stream.
-    _write_q: queue.Queue = queue.Queue(maxsize=16)
+    _write_q: queue.Queue = queue.Queue(maxsize=32)
 
     def _writer_fn():
         while True:
@@ -926,12 +1008,12 @@ def main():
                (" +augment" if args.augment else "")
     if _RICH:
         _console.print(f"  Output  : [cyan]source resolution[/cyan] · "
-                       f"[cyan]{OUT_FPS}fps[/cyan]")
+                       f"[cyan]native fps[/cyan]")
         _console.print(f"  Mode    : [cyan]{mode_str}[/cyan]  "
                        f"conf=[cyan]{args.conf}[/cyan]")
         _console.print(f"  Videos  : [cyan]{len(input_files)}[/cyan]\n")
     else:
-        print(f"Output : source resolution · {OUT_FPS}fps")
+        print(f"Output : source resolution · native fps")
         print(f"Mode   : {mode_str}  conf={args.conf}")
         print(f"Videos : {len(input_files)}\n")
 
