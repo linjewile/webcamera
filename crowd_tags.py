@@ -323,12 +323,10 @@ class PersonHashMap:
 
     # ── public API ───────────────────────────────────────────────────────────
 
-    def get_quote(self, crop_bgr: np.ndarray) -> tuple[str, int] | None:
+    def get_quote(self, crop_bgr: np.ndarray, tag_fn=None) -> tuple[str, int] | None:
         """
         Return (quote, palette_idx) for this crop, or None if crop too small.
-        Tag is ALWAYS drawn fresh from the shuffled deck — never reused from
-        a previous session — to guarantee no two people in the same video
-        share a tag.
+        Accepts a tag_fn callable that returns a unique tag string.
         """
         vec = self._compute_vec(crop_bgr)
         if vec is None:
@@ -350,18 +348,21 @@ class PersonHashMap:
             self._vecs[best_key] = avg
             self._map[best_key]["seen"] = self._map[best_key].get("seen", 1) + 1
             pal = self._map[best_key]["palette_idx"]
+            tag = self._map[best_key].get("quote", "")
+            if not tag:
+                tag = tag_fn() if tag_fn else "unknown"
+                self._map[best_key]["quote"] = tag
         else:
             new_key = self._vec_to_key(vec)
+            tag = tag_fn() if tag_fn else "unknown"
             pal = random.randrange(len(PALETTES))
             self._map[new_key] = {
-                "quote":       "",
+                "quote":       tag,
                 "palette_idx": pal,
                 "seen":        1,
             }
             self._vecs[new_key] = vec
 
-        # Always draw a fresh unique tag from the deck
-        tag = _draw_unique_tag()
         return tag, pal
 
 
@@ -393,36 +394,6 @@ class TrackState:
                 a * new + (1 - a) * old
                 for new, old in zip(box, self.smooth_box)
             )
-
-
-_registry: dict[int, TrackState] = {}
-_ghosts:   dict[int, TrackState] = {}
-_last_frame_count: int = 0
-_tag_deck:  list[str] = []         # shuffled deck — pop to assign, never put back
-
-
-def _reset_state():
-    _registry.clear()
-    _ghosts.clear()
-    _tag_deck.clear()
-    _tag_deck.extend(TAGS)
-    random.shuffle(_tag_deck)
-
-
-def _get_state(track_id: int) -> TrackState:
-    return _registry[track_id]
-
-
-def _draw_unique_tag() -> str:
-    """Pop the next tag from the shuffled deck. Like drawing a card — once
-    it's drawn, it's gone. No repeats until the deck is exhausted."""
-    if _tag_deck:
-        return _tag_deck.pop()
-    # Deck empty (45+ people) — impossible to avoid reuse, but make it
-    # obvious by appending a number so it's visually distinct.
-    _tag_deck.extend(TAGS)
-    random.shuffle(_tag_deck)
-    return _tag_deck.pop()
 
 
 # ── appearance helpers ────────────────────────────────────────────────────────
@@ -457,64 +428,93 @@ def _iou(a, b) -> float:
     return inter / ua if ua > 0 else 0.0
 
 
-def _expire_ghosts(current_frame: int):
-    dead = [k for k, gs in _ghosts.items()
-            if current_frame - gs.last_frame > GHOST_FRAMES]
-    for k in dead:
-        del _ghosts[k]
+# ─────────────────────────────────────────────────────────────────────────────
+#  VideoSession  —  per-video tracking state (replaces module-level globals)
+# ─────────────────────────────────────────────────────────────────────────────
 
+class VideoSession:
+    """Bundles all mutable per-video state: track registry, ghost buffer,
+    tag deck, text-render cache.  Creating a new session per video keeps
+    everything isolated and thread-safe."""
 
-def _match_ghost(box, app, current_frame: int) -> int | None:
-    _expire_ghosts(current_frame)
-    best_id, best_score = None, REID_MIN_SCORE
-    for gid, gs in _ghosts.items():
-        if gs.last_box is None:
-            continue
-        score = REID_APP_W * _app_sim(app, gs.appearance) + REID_IOU_W * _iou(box, gs.last_box)
-        if score > best_score:
-            best_score, best_id = score, gid
-    return best_id
+    def __init__(self):
+        self.registry: dict[int, TrackState] = {}
+        self.ghosts:   dict[int, TrackState] = {}
+        self.tag_deck: list[str] = list(TAGS)
+        random.shuffle(self.tag_deck)
+        self.text_cache: dict[tuple[str, int], np.ndarray] = {}
 
+    def draw_unique_tag(self) -> str:
+        """Pop the next tag from the shuffled deck, skipping any already on screen."""
+        active_tags = {s.tag for s in self.registry.values()}
+        # Try to find an unused tag in the remaining deck
+        while self.tag_deck:
+            candidate = self.tag_deck.pop()
+            if candidate not in active_tags:
+                return candidate
+        # Deck exhausted — refill with only tags not currently in use
+        available = [t for t in TAGS if t not in active_tags]
+        if not available:
+            available = list(TAGS)  # all tags are in use; allow duplicates
+        self.tag_deck = available
+        random.shuffle(self.tag_deck)
+        return self.tag_deck.pop()
 
-def _on_track_seen(track_id: int, box, frame: np.ndarray,
-                   frame_idx: int, hashmap: PersonHashMap):
-    x1, y1, x2, y2 = box
+    def _expire_ghosts(self, current_frame: int):
+        dead = [k for k, gs in self.ghosts.items()
+                if current_frame - gs.last_frame > GHOST_FRAMES]
+        for k in dead:
+            del self.ghosts[k]
 
-    if track_id not in _registry:
-        app  = _appearance_hist(frame, x1, y1, x2, y2)
-        crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-        ghost = _match_ghost(box, app, frame_idx)
+    def match_ghost(self, box, app, current_frame: int) -> int | None:
+        self._expire_ghosts(current_frame)
+        best_id, best_score = None, REID_MIN_SCORE
+        for gid, gs in self.ghosts.items():
+            if gs.last_box is None:
+                continue
+            score = (REID_APP_W * _app_sim(app, gs.appearance)
+                     + REID_IOU_W * _iou(box, gs.last_box))
+            if score > best_score:
+                best_score, best_id = score, gid
+        return best_id
 
-        if ghost is not None:
-            _registry[track_id] = _ghosts.pop(ghost)
-        else:
-            result = hashmap.get_quote(crop) if crop.size > 0 else None
-            if result:
-                tag, pal = result
+    def on_track_seen(self, track_id: int, box, frame: np.ndarray,
+                      frame_idx: int, hashmap: PersonHashMap):
+        x1, y1, x2, y2 = box
+
+        if track_id not in self.registry:
+            app  = _appearance_hist(frame, x1, y1, x2, y2)
+            crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+            ghost = self.match_ghost(box, app, frame_idx)
+
+            if ghost is not None:
+                self.registry[track_id] = self.ghosts.pop(ghost)
             else:
-                tag, pal = _draw_unique_tag(), random.randrange(len(PALETTES))
-            _registry[track_id] = TrackState(tag, pal)
-        state = _registry[track_id]
-        state.appearance = app
-    else:
-        state = _registry[track_id]
-        state._app_ctr += 1
-        # Only refresh appearance every 5th frame for established tracks
-        if state._app_ctr % 5 == 0:
-            state.appearance = _appearance_hist(frame, x1, y1, x2, y2)
+                result = hashmap.get_quote(crop, self.draw_unique_tag) if crop.size > 0 else None
+                if result:
+                    tag, pal = result
+                else:
+                    tag, pal = self.draw_unique_tag(), random.randrange(len(PALETTES))
+                self.registry[track_id] = TrackState(tag, pal)
+            state = self.registry[track_id]
+            state.appearance = app
+        else:
+            state = self.registry[track_id]
+            state._app_ctr += 1
+            if state._app_ctr % 5 == 0:
+                state.appearance = _appearance_hist(frame, x1, y1, x2, y2)
 
-    state.last_box   = box
-    state.update_smooth_box(box)
-    state.last_frame = frame_idx
+        state.last_box   = box
+        state.update_smooth_box(box)
+        state.last_frame = frame_idx
 
-
-def _on_track_lost(track_id: int):
-    if track_id in _registry:
-        _ghosts[track_id] = _registry.pop(track_id)
+    def on_track_lost(self, track_id: int):
+        if track_id in self.registry:
+            self.ghosts[track_id] = self.registry.pop(track_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Tag rendering  (Pillow + custom or system font)
+#  Tag rendering  (cached text images — no per-frame PIL round-trip)
 # ─────────────────────────────────────────────────────────────────────────────
 _LOCAL_FONT = Path(__file__).parent / "font familia" / "Butler FREE" \
               / "OTF - best in most cases" / "Butler-Free-Bd.otf"
@@ -573,23 +573,75 @@ def _fit_font_size_wrapped(text: str, max_width: int, max_height: int) -> tuple[
     return best_size, best_lines
 
 
-def render_tags(frame_bgr: np.ndarray, detections: list) -> np.ndarray:
+def _render_text_image(text: str, font_size: int, lines: list[str],
+                       color: tuple = (255, 255, 255),
+                       bg: tuple | None = None) -> np.ndarray:
+    """Render wrapped text lines to a small BGRA numpy array (cached per tag+size+color).
+    If bg is provided as (R, G, B, A), a rounded-rect pill is drawn behind the text."""
+    font = _get_font(font_size)
+    line_h = font.getbbox("Ag")[3] - font.getbbox("Ag")[1]
+    line_spacing = PAD_Y
+    widths = [(font.getbbox(ln)[2] - font.getbbox(ln)[0]) for ln in lines]
+    total_w = max(widths) + 2 * PAD_X
+    total_h = line_h * len(lines) + line_spacing * (len(lines) - 1) + 2 * PAD_Y
+
+    pil_img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(pil_img)
+
+    # Draw background pill
+    if bg is not None:
+        radius = min(PAD_X, PAD_Y, total_h // 4)
+        draw.rounded_rectangle([0, 0, total_w - 1, total_h - 1],
+                               radius=radius, fill=bg)
+
+    r, g, b = color
+    for i, ln in enumerate(lines):
+        lbbox = font.getbbox(ln)
+        lw = lbbox[2] - lbbox[0]
+        tx = (total_w - lw) // 2 - lbbox[0]
+        ty = PAD_Y + i * (line_h + line_spacing) - lbbox[1]
+        draw.text((tx, ty), ln, fill=(r, g, b, 255), font=font)
+
+    rgba = np.array(pil_img)
+    bgra = rgba[:, :, [2, 1, 0, 3]].copy()
+    return bgra
+
+
+def _alpha_blend(frame_bgr: np.ndarray, overlay_bgra: np.ndarray, cx: int, cy: int):
+    """Alpha-blend a small BGRA overlay centred at (cx, cy) onto frame_bgr in-place."""
+    h_o, w_o = overlay_bgra.shape[:2]
+    h_f, w_f = frame_bgr.shape[:2]
+    x = cx - w_o // 2
+    y = cy - h_o // 2
+
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(w_f, x + w_o), min(h_f, y + h_o)
+    if x1 >= x2 or y1 >= y2:
+        return
+
+    ox1, oy1 = x1 - x, y1 - y
+    ox2, oy2 = ox1 + (x2 - x1), oy1 + (y2 - y1)
+
+    overlay_roi = overlay_bgra[oy1:oy2, ox1:ox2]
+    alpha = overlay_roi[:, :, 3:4].astype(np.float32) * (1.0 / 255.0)
+    roi = frame_bgr[y1:y2, x1:x2].astype(np.float32)
+    blended = alpha * overlay_roi[:, :, :3].astype(np.float32) + (1.0 - alpha) * roi
+    frame_bgr[y1:y2, x1:x2] = blended.astype(np.uint8)
+
+
+def render_tags(frame_bgr: np.ndarray, detections: list,
+                session: 'VideoSession') -> np.ndarray:
+    """Overlay tag text on each tracked person.  Text images are rendered via
+    PIL only on first encounter, then cached in session.text_cache and
+    alpha-blended with pure numpy — no full-frame PIL conversion."""
     if not detections:
         return frame_bgr
 
-    h, w = frame_bgr.shape[:2]
-
-    # Convert to PIL once, draw all tags, convert back
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(frame_rgb)
-    draw = ImageDraw.Draw(pil_img)
-
     for track_id, x1, y1, x2, y2 in detections:
-        if track_id not in _registry:
+        if track_id not in session.registry:
             continue
-        state = _get_state(track_id)
+        state = session.registry[track_id]
 
-        # Use smoothed box for stable text positioning
         if state.smooth_box is not None:
             sx1, sy1, sx2, sy2 = (int(c) for c in state.smooth_box)
         else:
@@ -601,30 +653,20 @@ def render_tags(frame_bgr: np.ndarray, detections: list) -> np.ndarray:
             continue
 
         font_size, lines = _fit_font_size_wrapped(state.tag, box_w, box_h)
-        font = _get_font(font_size)
-        line_h = font.getbbox("Ag")[3] - font.getbbox("Ag")[1]
-        line_spacing = PAD_Y
-        total_text_h = line_h * len(lines) + line_spacing * (len(lines) - 1)
 
-        # Centre the text block on the smoothed person position
+        bg_color   = state.palette[0]   # (R, G, B, A)
+        text_color = state.palette[1]
+        cache_key = (state.tag, font_size, text_color, bg_color)
+        text_img = session.text_cache.get(cache_key)
+        if text_img is None:
+            text_img = _render_text_image(state.tag, font_size, lines,
+                                          text_color, bg=bg_color)
+            session.text_cache[cache_key] = text_img
+
         cx = (sx1 + sx2) // 2
         cy = (sy1 + sy2) // 2
-        block_y = cy - total_text_h // 2
+        _alpha_blend(frame_bgr, text_img, cx, cy)
 
-        for i, line in enumerate(lines):
-            lbbox = font.getbbox(line)
-            lw = lbbox[2] - lbbox[0]
-            text_x = int(max(0, min(cx - lw // 2, w - lw))) - lbbox[0]
-            text_y = int(block_y + i * (line_h + line_spacing)) - lbbox[1]
-            # Dark outline for readability on any background
-            outline_d = max(1, font_size // 18)
-            for ox, oy in [(-outline_d,0),(outline_d,0),(0,-outline_d),(0,outline_d),
-                           (-outline_d,-outline_d),(outline_d,-outline_d),
-                           (-outline_d,outline_d),(outline_d,outline_d)]:
-                draw.text((text_x+ox, text_y+oy), line, fill=(0, 0, 0), font=font)
-            draw.text((text_x, text_y), line, fill=(255, 255, 255), font=font)
-
-    frame_bgr[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     return frame_bgr
 
 
@@ -654,9 +696,8 @@ def process_video(input_path: Path, model: YOLO,
                   imgsz: int = 640,
                   augment: bool = False,
                   half: bool = False,
-                  detect_every: int = DETECT_EVERY) -> Path | None:
-    global _last_frame_count
-    _reset_state()
+                  detect_every: int = DETECT_EVERY) -> tuple[Path | None, int]:
+    session = VideoSession()
 
     # Per-video tracker for tiled mode
     sv_tracker = sv.ByteTrack() if (tiled and _SV) else None
@@ -665,7 +706,7 @@ def process_video(input_path: Path, model: YOLO,
     if not cap.isOpened():
         (_console.print(f"[red]  [!] Cannot open {input_path.name}[/red]") if _RICH
          else print(f"  [!] Cannot open {input_path.name}"))
-        return None
+        return None, 0
 
     src_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -740,7 +781,11 @@ def process_video(input_path: Path, model: YOLO,
             run_detect = (write_idx % detect_every == 0)
 
             if not run_detect:
-                tagged = render_tags(frame, cached_detections)
+                # Interpolate smooth boxes forward so tags glide between detections
+                for tid, bx1, by1, bx2, by2 in cached_detections:
+                    if tid in session.registry:
+                        session.registry[tid].update_smooth_box((bx1, by1, bx2, by2))
+                tagged = render_tags(frame, cached_detections, session)
                 _write_q.put(tagged)
                 write_idx += 1
                 if _RICH and task_id is not None:
@@ -775,7 +820,7 @@ def process_video(input_path: Path, model: YOLO,
                     x1,y1,x2,y2 = map(int, sv_tracks.xyxy[i])
                     detections.append((tid, x1, y1, x2, y2))
                     curr_ids.add(tid)
-                    _on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx, hashmap)
+                    session.on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx, hashmap)
 
             else:
                 # ── Standard model.track at high resolution ──────────────────
@@ -801,14 +846,14 @@ def process_video(input_path: Path, model: YOLO,
                         x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
                         detections.append((tid, x1, y1, x2, y2))
                         curr_ids.add(tid)
-                        _on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx, hashmap)
+                        session.on_track_seen(tid, (x1, y1, x2, y2), frame, frame_idx, hashmap)
 
             for lost in prev_ids - curr_ids:
-                _on_track_lost(lost)
+                session.on_track_lost(lost)
             prev_ids = curr_ids
 
             cached_detections = detections   # cache for skipped frames
-            tagged = render_tags(frame, detections)
+            tagged = render_tags(frame, detections, session)
             _write_q.put(tagged)
 
             write_idx += 1
@@ -838,14 +883,13 @@ def process_video(input_path: Path, model: YOLO,
     cap.release()
     writer.release()
     hashmap.save()
-    _last_frame_count = write_idx
 
     if _RICH:
         _console.print(f"  [green]✓[/green] Saved → [bold]{out_path.name}[/bold]  "
                        f"([cyan]{write_idx}[/cyan] frames)\n")
     else:
         print(f"\n  Saved → {out_path.name}  ({write_idx} frames)")
-    return out_path
+    return out_path, write_idx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1023,14 +1067,12 @@ def main():
         if _RICH:
             _console.rule(f"[bold white]{i}/{len(input_files)}  {video.name}[/bold white]")
         t0 = time.time()
-        out = process_video(video, model, conf=args.conf, hashmap=hashmap,
-                            tiled=args.tile, imgsz=args.imgsz,
-                            augment=args.augment, half=args.half,
-                            detect_every=args.skip)
+        out, frame_count = process_video(video, model, conf=args.conf, hashmap=hashmap,
+                                         tiled=args.tile, imgsz=args.imgsz,
+                                         augment=args.augment, half=args.half,
+                                         detect_every=args.skip)
         elapsed = time.time() - t0
-        # process_video returns frame count via its own print; we track externally
-        # Collect frame count from out metadata isn't available, use a sentinel
-        summary.append((video.name, _last_frame_count, elapsed))
+        summary.append((video.name, frame_count, elapsed))
 
     hashmap.print_map()
     _print_summary(summary)
